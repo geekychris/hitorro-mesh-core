@@ -1029,6 +1029,55 @@ scenarios where event-time is arbitrary (not aligned with wall-clock).
   cover the wire-up. An integration test with real time-based idle
   would be flaky and add maintenance cost with no correctness gain.
 
+## ✅ Phase 7b — Query timeouts + cancel propagation (shipped)
+
+Long-running queries — especially streaming or misbehaving batch —
+now have a hard deadline. `QueryDispatcher.submit(sql, Duration)` arms
+a scheduled cancel; on expiry, `CancelMessage` propagates to every
+agent working on that queryId, the handle closes, and further
+`nextRow` calls return null with `timedOut() == true`.
+
+**What's new:**
+- `QueryDispatcher.submit(String sql, Duration timeout)` — new
+  overload; zero/negative timeout → same as no-timeout submit
+- `QueryDispatcher.timeoutScheduler` — single-thread daemon
+  `ScheduledExecutorService` shared across all handles
+- `QueryHandle.withTimeout(Duration, ScheduledExecutorService)` —
+  arms a deadline; scheduled task fires close() on expiry
+- `QueryHandle.timedOut()` — flag set by the scheduled close, false
+  for natural completion
+- `QueryHandle.onCloseUnblock` — nullable `Runnable` called during
+  close(); queue-based handles register a `queue.add(EOS_ALL)` so
+  any nextRow blocked on poll returns null immediately (merge-source
+  handles pass null — nextRow just times out on its own budget)
+- REST controller: uses new overload; response now includes
+  `timedOut` field (back-compat 4-arg constructor still works)
+
+**Where:**
+- Driver: [`QueryDispatcher.submit(String, Duration)`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/QueryDispatcher.java) + `QueryHandle.withTimeout` + `timedOut()` + `onCloseUnblock` machinery
+- REST: [`MeshRestController.submit`](../hitorro-mesh-driver-app/src/main/java/com/hitorro/mesh/driver/app/MeshRestController.java) uses the new overload
+- 3 tests: [`QueryTimeoutTest`](../hitorro-mesh-examples/src/test/java/com/hitorro/mesh/examples/QueryTimeoutTest.java) — never-completing stream fires within deadline delta, natural completion before deadline leaves `timedOut()` false, no-timeout back-compat unchanged
+
+**Design decisions:**
+- **Deadline armed at submit time, not per-nextRow.** Users get one
+  bounded deadline for the whole query lifetime — matches SQL client
+  intuition. Per-nextRow timeouts stay as the polling budget for
+  streaming iteration.
+- **`timedOut()` flag over exception.** Callers commonly want partial
+  results on timeout (some rows arrived before deadline), and an
+  exception would discard them. Flag lets them inspect + drain.
+- **Single shared scheduler.** One daemon thread handles all query
+  timeouts cluster-wide — timers are cheap. Sized 1 to bound overhead.
+- **`onCloseUnblock` pattern, not `interrupt`.** Interrupting the
+  caller's thread would surface as `InterruptedException` in
+  arbitrary places. Pushing EOS_ALL into the queue is a clean signal
+  that flows through the existing null-EOS convention.
+- **Merge-source handles skip the unblock** (null Runnable). The
+  merge iterator has no queue to push to — nextRow just times out
+  on its own polling budget. Acceptable trade-off for a rare edge
+  case; a follow-up could add an "interrupt current poll" hook to
+  RowSource if this becomes a hotspot.
+
 ## ✅ Phase 6d.2.3 — User-alias preservation through combine (shipped)
 
 Combined two-stage output now honors the user's `AS foo` aliases from

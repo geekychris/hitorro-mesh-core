@@ -207,6 +207,17 @@ partition has been silent for longer than `hitorro.mesh.watermark.idle-timeout-m
 event-time flows at real-time rate — safe default for real-time streams;
 opt out via a very large value for backfill scenarios.
 
+**Phase 6d.2.3 (shipped):** user-alias preservation through combine.
+Combined output honors the user's `AS foo` aliases from their SELECT
+list — no more surprise `g0`/`c0` column names for aliased queries.
+
+**Phase 7b (shipped):** query timeouts + cancel propagation.
+`QueryDispatcher.submit(sql, Duration)` arms a hard deadline; on
+expiry, `CancelMessage` reaches every agent working on that queryId
+and the handle closes with `timedOut() == true`. REST endpoint uses
+this by default. `onCloseUnblock` runnable pattern signals waiting
+`nextRow` callers cleanly (no interrupt).
+
 **Phase 5b.2 (shipped):** N-way merge sort for `SimplePlan + ORDER BY`.
 Driver memory is O(N partitions) instead of O(total rows) — each
 partition already sorts locally (via pushdown), driver merges the
