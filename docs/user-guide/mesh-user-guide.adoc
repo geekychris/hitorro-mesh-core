@@ -128,23 +128,254 @@ Python or R client, or years of SQL query-optimizer tuning. It is
 documents across horizontally-sharded stores, with optional streaming
 ingest and long-lived windowed aggregates.
 
-=== Comparison at a glance
+=== What the mesh distributes
 
-[cols="2,1,1,1", options="header"]
-|===
-| Capability | Mesh | Spark | Flink
+The full distributed SQL surface. All ✅ items are shipped, tested, and
+covered by the reproducer scripts. Numbers reference the phase entries
+in `hitorro-mesh-core/ROADMAP.md`.
 
-| Distributed SQL over JSON | ✅ | ✅ (Dataset<Row>) | ✅ (Table API)
-| Broadcast + shuffle-hash JOIN | ✅ | ✅ | ✅
-| Streaming windowed aggregate | ✅ | Structured Streaming | ✅ (native)
-| Streaming JOIN (windowed) | ⚠️ Planned (phase 8) | ✅ | ✅
-| Cost-based optimizer | ❌ (regex planner) | ✅ | ✅
-| Multi-language clients | ❌ (REST/SSE only) | ✅ (Py/R/Scala) | ✅ (Py/Scala/SQL)
-| Sub-100ms query latency | ✅ | ⚠️ | ✅
-| Bundle-size overhead | ~65 MB fat-jar | ~800 MB+ install | ~500 MB
-| Operational complexity | Low (NATS + JVMs) | High (cluster mgr) | Med
-| Type system integration | Deep (JVS native) | Via schema | Via schema
+[cols="3,1,3", options="header"]
 |===
+| SQL feature | Status | Notes
+
+| SELECT / WHERE / projection
+| ✅
+| Fanned out to every partition, union at driver (`SimplePlan`)
+
+| GROUP BY + aggregates (COUNT, SUM, MIN, MAX)
+| ✅
+| Two-stage combine, driver- or worker-side (phases 2, 2.5.1)
+
+| AVG
+| ✅
+| Decomposes to SUM+COUNT partials, driver reconstructs (phase 3)
+
+| HAVING
+| ✅
+| Rewritten to reference combine-side aliases (phase 3)
+
+| SELECT DISTINCT
+| ✅
+| Auto-rewrites to GROUP BY on all selected cols (phase 3)
+
+| LIMIT — with pushdown to agents
+| ✅
+| Each partition returns at most N rows (phase 5b.3)
+
+| ORDER BY — with N-way merge sort
+| ✅
+| Bounded-memory sort across partitions (phase 5b.2)
+
+| Broadcast JOIN — INNER, LEFT, RIGHT, FULL OUTER
+| ✅
+| Small dimension table replicated to every agent (phases 4a, 4c)
+
+| Shuffle-hash JOIN — INNER, LEFT, RIGHT, FULL OUTER
+| ✅
+| Fact × fact between two distributed tables (phases 4b, 4c.1)
+
+| Shuffle-hash JOIN + WHERE (per-side pushdown)
+| ✅
+| Single-side conjuncts filter pre-shuffle (phases 4b.1, 4b.2.1)
+
+| Shuffle-hash JOIN + GROUP BY / aggregates
+| ✅
+| Three-stage combine (partial-agg per bucket → driver merge) (phase 4b.2)
+
+| Global aggregate over JOIN (no GROUP BY)
+| ✅
+| Single-row result from a joined fact table
+
+| Windowed aggregate — batch source
+| ✅
+| `WIN_START` in GROUP BY (phase 6d)
+
+| Windowed aggregate — streaming source (single partition)
+| ✅
+| Incremental emit as watermarks advance (phase 6d.1)
+
+| Windowed aggregate — streaming source (multi-partition)
+| ✅
+| Cross-partition combine with advance-past close detection (phase 6d.2)
+
+| Watermark heartbeats
+| ✅
+| Sparse-emitter partitions still advance global close (phase 6d.2.1)
+
+| Idle-timeout watermarks
+| ✅
+| Truly-idle partitions don't stall (phase 6d.2.2)
+
+| User-alias preservation through combine
+| ✅
+| `SELECT lang AS L, COUNT(*) AS n` returns `L`, `n` not `g0`, `c0` (phase 6d.2.3)
+
+| Streaming JOIN (two streaming sources, windowed)
+| 🔵 Planned
+| Phase 8 — biggest remaining SQL gap
+
+| Subqueries / CTEs / OVER PARTITION BY / PIVOT
+| ❌
+| Out of scope. Run these against a single jvssql engine.
+|===
+
+=== What the mesh gives you beyond SQL
+
+Not usually featured in an SQL-engine comparison, but part of the mesh's
+production story.
+
+[cols="3,1,3", options="header"]
+|===
+| Capability | Status | Notes
+
+| Batch REST endpoint (`POST /mesh/queries`)
+| ✅
+| Submit + collect, JSON in/out
+
+| Streaming REST endpoint (`GET /mesh/queries/stream`, SSE)
+| ✅
+| Row-at-a-time push to browser / any HTTP client
+
+| Explicit cancel (`DELETE /mesh/queries/{queryId}`)
+| ✅
+| Interrupts in-flight agent tasks; idempotent (phase 7d)
+
+| Query timeout with clean cancel propagation
+| ✅
+| Deadline armed at submit; `timedOut` flag on response (phase 7b)
+
+| Whole-query retry with exponential backoff
+| ✅
+| Configurable per-request via `retries` field (phase 7g)
+
+| Task-level surgical retry (per partition, on error)
+| ✅
+| Retries only failed partition if no rows emitted yet (phase 7k)
+
+| Backpressure with drop metric
+| ✅
+| Bounded result queue, non-fatal overflow (phase 7i)
+
+| Structured typed error responses (JSON)
+| ✅
+| `QueryTimeoutException` → 408, `AgentTaskException` → 502, etc. (phase 7c)
+
+| EXPLAIN endpoint (`GET /mesh/queries/explain`)
+| ✅
+| See the plan without executing (phase 7h)
+
+| List active queries (`GET /mesh/queries`)
+| ✅
+| Operator visibility (phase 7d)
+
+| TLS transport
+| ✅
+| PKCS12 truststore, custom trust anchor (phase 7a)
+
+| Mutual TLS (mTLS)
+| ✅
+| Client cert via keystore (phase 7a)
+
+| NATS auth — .creds / token / user-pass
+| ✅
+| Precedence: creds > token > user/pass (phase 7a)
+
+| Prometheus metrics — driver-side
+| ✅
+| Query timers, agent count, table count, backpressure
+
+| Prometheus metrics — agent-side
+| ✅
+| Per-agent task + row + watermark counters (phase 7m)
+
+| Spring Boot HealthIndicator with per-partition coverage
+| ✅
+| Composite `/actuator/health` reports OUT_OF_SERVICE for uncovered shards (phase 7j)
+
+| Streaming source adapters — Kafka, NATS JetStream
+| ✅
+| Config-driven in agent YAML (phase 6b.1)
+
+| In-memory streaming source (dev / tests)
+| ✅
+| `InMemoryStreamingTable.pushRow/stop`
+
+| Kubernetes deploy via Helm chart
+| ✅
+| Hardened: securityContext, PDB, split probes, TLS values (phase 7e)
+
+| Docker Compose deploy
+| ✅
+| 5-container stack; images non-root + healthcheck (phase 7e)
+
+| Orion (Rust runtime) deploy path
+| ✅
+| Alternative to K8s; capability-aware native binaries
+
+| Embeddable in a Spring Boot app
+| ✅
+| Everything is a POJO/Spring bean; in-memory transport for tests
+|===
+
+=== When to pick the mesh vs Spark or Flink
+
+An honest tradeoff table — not "who has more features" but "where does
+each fit best."
+
+[cols="3,3,3,3", options="header"]
+|===
+| Concern | Mesh | Spark | Flink
+
+| Deployment overhead
+| Just JVMs + NATS. No cluster manager.
+| Needs YARN / K8s / Standalone cluster.
+| Needs its own JobManager / TaskManager cluster.
+
+| Startup cold time
+| ~2 seconds (fat-jar JVM start)
+| ~30 seconds (cluster spin-up)
+| ~10 seconds
+
+| Bundle size on disk
+| ~65 MB per fat-jar
+| ~800 MB+ install
+| ~500 MB
+
+| Query planner sophistication
+| Regex-based, no cost model — good for simple/known workloads
+| Full cost-based optimizer + Catalyst
+| Full cost-based optimizer
+
+| Client languages
+| HTTP (any language) or embedded Java
+| Python, R, Scala, Java, SQL client
+| Python, Scala, Java, SQL client
+
+| Stateful streaming (checkpoints, savepoints)
+| ❌ Not supported
+| ✅ Structured Streaming
+| ✅ Native — production streaming systems' default
+
+| Native support for typed JSON documents
+| Deep (JVS types, `jvssql`)
+| Via schema inference or explicit case classes
+| Via Table API schema
+
+| SLA target
+| Sub-100ms query latency achievable
+| Seconds to minutes typical
+| Sub-second achievable
+
+| Best fit
+| Distributed SQL over JVS-typed JSON, embedded or standalone; teams that don't want cluster-manager complexity
+| Batch + interactive SQL on huge data; ML pipelines
+| High-throughput long-lived streaming with exactly-once semantics
+|===
+
+The mesh is *purpose-built for one thing very well:* distributed SQL
+over typed JSON documents, at low deployment cost, with real production
+plumbing (metrics, retries, timeouts, cancels, hardened deploys). It's
+not trying to replace Spark or Flink at their strengths.
 
 === Design principles
 
