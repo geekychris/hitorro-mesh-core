@@ -203,6 +203,21 @@ curl -X DELETE http://localhost:8085/mesh/queries/{queryId}
 curl -s http://localhost:8085/mesh/queries | jq   # list in-flight
 ```
 
+**Explain a query** (phase 7h) — see the planned execution shape without running:
+```bash
+curl -s 'http://localhost:8085/mesh/queries/explain?sql=SELECT+lang,+COUNT(*)+FROM+docs+GROUP+BY+lang' | jq
+# → { planType: "TwoStagePlan", partialSql: "SELECT lang, COUNT(*) AS __c0__ ...",
+#     combineSql: "SELECT lang, SUM(__c0__) AS c0 ...", partitions: [...] }
+```
+
+**Retry** transient failures (phase 7g) — pass `retries` in the request body:
+```bash
+curl -X POST http://localhost:8085/mesh/queries \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT id FROM docs","timeoutMs":5000,"retries":2}'
+# Retries whole query up to 2 times on AgentTaskException with 100ms · 2^n backoff.
+```
+
 **Server-Sent Events** for row-at-a-time streaming:
 ```bash
 curl -N 'http://localhost:8085/mesh/queries/stream?sql=SELECT+id+FROM+docs&timeoutMs=60000'
