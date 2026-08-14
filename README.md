@@ -1,5 +1,9 @@
 # Hitorro Mesh
 
+> **New here? Jump straight to [GETTING_STARTED.md](GETTING_STARTED.md)** —
+> four deployment tiers from 30-second in-JVM demo to production Kubernetes,
+> with a query cheat sheet and troubleshooting guide.
+
 A **Spark-like distributed compute layer over the Hitorro stack.** Runs
 distributed SQL queries against `JVS` document streams across a cluster of
 worker processes, using NATS for messaging.
