@@ -174,6 +174,17 @@ attribution, no OR at top level. Combines still evaluate the full
 WHERE (redundant but bug-safe — extra CPU per surviving row, not
 wrong results).
 
+**Phase 6d.1 (shipped, MVP):** watermark-driven windowed streaming.
+Long-lived windowed aggregate queries over streaming sources —
+windows close and emit incrementally as the watermark advances past
+their end time, no waiting for end-of-scan. Zero wire protocol
+changes: agent registers streaming source with jvssql's `StreamConfig`,
+jvssql auto-swaps to incremental `StreamingAggregate` executor.
+New `StreamingSimplePlan` variant routes windowed aggregates over
+streaming sources bypass the batch two-stage combine. MVP scope:
+single-partition sources only (multi-partition needs incremental
+cross-partition combine — phase 6d.2).
+
 **Phase 5b.2 (shipped):** N-way merge sort for `SimplePlan + ORDER BY`.
 Driver memory is O(N partitions) instead of O(total rows) — each
 partition already sorts locally (via pushdown), driver merges the

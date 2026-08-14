@@ -809,11 +809,76 @@ hitorro:
   can verify the mesh peer picked up their config, without leaking
   secrets to the log.
 
-## ⚪ Phase 6d.1 — Watermark-driven windowed streaming
-- Long-lived streaming query — combine flushes each window as watermark
-  advances past its close time
-- jvssql already has watermark tracking; the mesh needs to plumb "flush
-  this window" signals from combine back through the result subject
+## ✅ Phase 6d.1 — Watermark-driven windowed streaming (shipped, MVP)
+
+Long-lived windowed aggregate queries over streaming sources. Windows
+close and emit incrementally as the watermark advances past their end
+time — no waiting for end-of-scan, no buffering-forever driver combine.
+
+**Execution shape:**
+1. `DistributedTable.streamConfig()` non-null declares a streaming source
+   → `DistributedTableRegistry.streamingTableNames()` picks it up
+2. `QueryPlanner.plan(...)` detects "windowed aggregate over streaming
+   source" (GROUP BY has `WIN_START`/`WIN_END`/`WIN_HOP_STARTS` +
+   source name is in `streamingTables`) → returns
+   `StreamingSimplePlan` BEFORE the batch two-stage detector
+3. `QueryDispatcher.submitStreamingSimple` dispatches ONE scan task
+   with the ORIGINAL SQL verbatim
+4. `TaskExecutor.registerLocalSource` (new shared helper) sees
+   `LocalTable.streamConfig()` non-null and calls
+   `builder.registerStream(name, iter, type, streamConfig)` — jvssql
+   then auto-swaps to the incremental `StreamingAggregate` executor
+5. Windows close as watermark (derived from event-time observations
+   in `WatermarkFilter`/`WatermarkTracker`) advances past their end;
+   per-window rows flow to the driver via regular ROW messages
+6. Query terminates on cancel or when the source signals end
+   (e.g. `InMemoryStreamingTable.stop()`)
+
+**Wire protocol changes:** NONE. Existing ROW/EOS/ERROR is sufficient
+— the "streaming" nature is fully encapsulated in the agent's
+StreamConfig registration.
+
+**MVP scope — single-partition sources only.** Multi-partition
+streaming aggregate would need incremental cross-partition combine
+(aggregating per-window partial rows from each partition as they
+arrive). That's phase 6d.2. Dispatcher rejects multi-partition with
+a clear message pointing at the deferred phase.
+
+**Where:**
+- Agent: [`LocalTable.streamConfig()`](../hitorro-mesh-agent/src/main/java/com/hitorro/mesh/agent/LocalTable.java) default method + [`InMemoryStreamingTable`](../hitorro-mesh-agent/src/main/java/com/hitorro/mesh/agent/InMemoryStreamingTable.java) constructor overloads for event-time
+- Agent: [`TaskExecutor.registerLocalSource`](../hitorro-mesh-agent/src/main/java/com/hitorro/mesh/agent/TaskExecutor.java) — shared helper that passes StreamConfig to jvssql when non-null; reused across broadcasts, plain scans, shuffled scans
+- Driver: [`DistributedTable.streamConfig()`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/DistributedTable.java) + [`DistributedTableRegistry.streamingTableNames()`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/DistributedTableRegistry.java)
+- Planner: [`QueryPlanner.StreamingSimplePlan`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/QueryPlanner.java) sealed variant + `tryPlanStreamingAggregate(...)` + `WINDOW_FUNC` regex; `plan(...)` overload accepts `streamingTables`
+- Dispatcher: [`QueryDispatcher.submitStreamingSimple`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/QueryDispatcher.java) — single-partition guard + reuses `submitSimple` for the actual scan
+- 2 tests: [`WindowedStreamingTest`](../hitorro-mesh-examples/src/test/java/com/hitorro/mesh/examples/WindowedStreamingTest.java) — closed windows emit incrementally as watermark advances (proves rows arrive BEFORE stream stops), multi-partition rejection
+
+**Design decisions:**
+- **Reuse jvssql's streaming aggregate verbatim.** All the hard math
+  (WatermarkTracker, per-window state, `closeReadyWindows`) already
+  lives in jvssql. The mesh's only job is to (a) know the source is
+  streaming and (b) register it that way. Cleanest possible layering.
+- **No wire protocol changes.** Windowed rows are just regular
+  aggregate rows arriving at their own cadence — the transport
+  doesn't need to know they're "windowed". Keeps the mesh's SPI narrow.
+- **Single-partition MVP.** Multi-partition needs cross-partition
+  combine (per-window incremental) which is a substantial addition
+  — dispatch reject with a clear phase-6d.2 pointer beats trying to
+  wire something half-correct.
+- **`StreamingSimplePlan`, not a flag on SimplePlan.** The planner
+  contract (single-agent, no combine, no EOS-buffering) is
+  meaningfully different. Sealed variant makes the pattern-match
+  exhaustive and reads more clearly than a nullable-config plan.
+- **Cancel = close = source-stop.** All three terminate the scan
+  cleanly via the existing cancel/interrupt path — no new
+  termination logic needed.
+
+**Still deferred (phase 6d.2):**
+- **Multi-partition streaming aggregate** — cross-partition combine
+  that emits per window as all partitions' partials arrive. Needs
+  a "streaming combine" variant of the phase-2 combiner-at-driver.
+- **Streaming joins** — windowed joins where both sides advance
+  independently.
+- **HAVING over streaming windows** — same combine issue as agg.
 
 ## ⚪ Phase 7 — Storage tiers as first-class LocalTable variants
 
