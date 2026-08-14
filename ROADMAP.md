@@ -876,9 +876,8 @@ a clear message pointing at the deferred phase.
 - **Streaming joins** — windowed joins where both sides advance
   independently.
 - **HAVING over streaming windows** — same combine issue as agg.
-- **User-alias preservation through combine** — combined windowed
-  output uses internal aliases (`g0`, `c0`) instead of the user's
-  `AS ws`/`AS n`. Same limitation as phase-2 combine. Not fixed here.
+- ~~User-alias preservation through combine~~ — shipped as
+  [phase 6d.2.3](#-phase-6d23--user-alias-preservation-through-combine-shipped).
 
 ## ✅ Phase 6d.2 — Multi-partition streaming aggregate (shipped)
 
@@ -1029,6 +1028,49 @@ scenarios where event-time is arbitrary (not aligned with wall-clock).
   logic offline; trust the phase-6d.2.1 heartbeat plumbing test to
   cover the wire-up. An integration test with real time-based idle
   would be flaky and add maintenance cost with no correctness gain.
+
+## ✅ Phase 6d.2.3 — User-alias preservation through combine (shipped)
+
+Combined two-stage output now honors the user's `AS foo` aliases from
+their SELECT list. Applies to all two-stage plans: phase-2 GROUP BY,
+phase 4b.2 shuffle-join+agg, phase 6d.1/6d.2 streaming windowed
+aggregate. Removes a small but confusing UX gotcha where `SELECT
+WIN_START(...) AS ws, COUNT(*) AS n GROUP BY ...` returned rows with
+columns `{g0, c0}` instead of `{ws, n}`.
+
+**How:**
+- `planTwoStage` parses each SELECT list item into a `SelectItem(expr, alias)`
+  via `parseSelectItems` (splits on top-level commas, peels `AS alias` off
+  each). Bare simple identifiers alias to themselves; complex expressions
+  without AS get a null alias (fall back to internal auto).
+- Group cols are matched to SELECT items by whitespace-normalized
+  expression equality (`normalizeExpr` collapses whitespace + tightens
+  around commas so `WIN_START(x, 60000)` matches `WIN_START(x,60000)`).
+- Aggregates matched to SELECT items by iteration order in the SELECT
+  list (first agg-call SELECT item → first combine def, etc.).
+- Combine SQL emits `<internalName> AS <userAlias>` when the user
+  provided an alias and it differs from the internal name; otherwise
+  just the bare internal name.
+
+**Where:**
+- Planner: [`QueryPlanner.SelectItem`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/QueryPlanner.java) + `parseSelectItems` + `normalizeExpr` + `AS_ALIAS` regex; `planTwoStage` builds `groupUserAliases` and `aggUserAliases` lists parallel to `groupPlan` and `combineDefs`
+- Updated 3 assertions in `WindowedStreamingTest` (which now sees `ws`/`n` instead of `g0`/`c0`)
+
+**Design decisions:**
+- **Fallback to internal when user didn't alias.** Existing tests without
+  `AS x` clauses continue to see `c0`, `g0`, etc. — zero-regression
+  compatibility for callers that never adopted aliases.
+- **Match aggregates by SELECT order, not by expression.** Two aggregates
+  with the same expression (e.g. `COUNT(*)`, `COUNT(*)`) would be
+  ambiguous; iteration order is deterministic and matches jvssql's own
+  aggregate handling.
+- **Whitespace-normalize before comparison.** `WIN_START(event_time, 60000)`
+  in the SELECT list vs. `WIN_START(event_time,60000)` in GROUP BY are
+  semantically the same; the normalizer strips gratuitous whitespace so
+  they compare equal. Case-preserving on identifiers (matches jvssql).
+- **Bare simple identifiers self-alias.** `SELECT lang FROM ...` implicitly
+  aliases as `lang` — already the behaviour, but now made explicit
+  through `parseSelectItems` so the alias-matching logic is uniform.
 
 **Where:**
 - Planner: [`QueryPlanner.StreamingWindowedPlan`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/QueryPlanner.java) with both original + partial/combine fields; `tryPlanStreamingAggregate` delegates to `planTwoStage` for the partial/combine rewrite
