@@ -192,6 +192,14 @@ all partitions, remaining buffered windows flush unconditionally.
 the original SQL (single-partition path) and partial/combine SQL
 (multi-partition path); dispatcher branches on partition count.
 
+**Phase 6d.2.1 (shipped):** watermark heartbeats. New
+`ResultMessage.Kind.WATERMARK` message; streaming scan tasks publish
+one every 200ms with the partition's max observed `event_time`. Driver
+converts to a "highest closed window" via the WIN_START step size, so
+partitions whose watermark has crossed a boundary WITHOUT emitting rows
+in the intervening windows still advance the global close detector.
+Fixes the sparse-emitter stall documented in phase 6d.2.
+
 **Phase 5b.2 (shipped):** N-way merge sort for `SimplePlan + ORDER BY`.
 Driver memory is O(N partitions) instead of O(total rows) — each
 partition already sorts locally (via pushdown), driver merges the

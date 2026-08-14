@@ -917,12 +917,71 @@ its final EOS. On cancel/close, same path via `QueryHandle.close()`
 publishing `CancelMessage`.
 
 **MVP caveats:**
-- **Idle-partition stall** — a partition that never emits (e.g. source
-  quiet for that partition) blocks window closure forever. Explicit
-  watermark heartbeats on the wire would fix this; not in the MVP.
+- **Sparse-emitter stall** — mitigated by phase-6d.2.1 watermark
+  heartbeats (see below). Pure-idle partitions (zero events ever)
+  still stall — needs system-time-based idle detection, deferred.
 - **User-alias loss** — combine output uses internal aliases
   (`g0`, `c0`) instead of user's `AS ws`/`AS n`. Same limitation
   as phase-2 combiner-at-driver.
+
+## ✅ Phase 6d.2.1 — Watermark heartbeats (shipped)
+
+Fixes the sparse-emitter stall in phase 6d.2. A streaming scan task
+now spawns a background heartbeat thread that publishes WATERMARK
+messages every 200ms carrying the partition's max observed event-time.
+The multi-partition combine uses these to advance window closure even
+for partitions whose watermark has crossed boundaries WITHOUT emitting
+rows in the intervening windows.
+
+**Wire protocol addition:**
+- `ResultMessage.Kind.WATERMARK` — new message kind
+- `ResultMessage.watermarkMs` — long, 0 for non-watermark messages
+- Static factory: `ResultMessage.watermark(taskId, partitionKey, wm)`
+
+**Agent side:**
+- New [`WatermarkTracker`](../hitorro-mesh-agent/src/main/java/com/hitorro/mesh/agent/WatermarkTracker.java) —
+  wraps a scan iterator to observe {@code event_time} on each row;
+  exposes running max as {@link #current()}. Atomic CAS-loop update
+  so it's safe to read from the heartbeat thread.
+- `TaskExecutor.runScanPlain` — for streaming sources, wraps the scan,
+  starts a `ScheduledExecutorService` heartbeat firing every 200ms.
+  Cancels on scan completion. Publishes only when at least one row
+  has been observed (skips MIN_VALUE sentinel).
+
+**Driver side:**
+- `submitStreamingMulti` handles a new WATERMARK case in its result
+  subscription. Extracts `windowSize` from `WIN_START(field, N)` in
+  the plan's original SQL via `extractWindowSize(sql)` (once at
+  dispatch, not per-message).
+- Converts watermark → highest-closed-window-start via
+  `wm >= size ? ((wm - size) / size) * size : MIN_VALUE`
+- Updates `partitionLatestWindow[pk] = max(current, latestClosed)`;
+  triggers `emitClosedWindows` on advance.
+
+**Where:**
+- Wire: [`ResultMessage`](src/main/java/com/hitorro/mesh/ResultMessage.java) — WATERMARK kind + `watermarkMs` field + `watermark(...)` factory
+- Agent: [`WatermarkTracker`](../hitorro-mesh-agent/src/main/java/com/hitorro/mesh/agent/WatermarkTracker.java) (new) + `TaskExecutor.runScanPlain` heartbeat wiring
+- Driver: `QueryDispatcher.submitStreamingMulti` — WATERMARK case + `extractWindowSize` helper
+- 1 new test: `WindowedStreamingTest.watermarkHeartbeats_unblockWindowClosureForSparseEmitter` — p1 events span windows 0 and 480k, p2 only events at 480k. Window 0 closes via p2's heartbeat (not via row emission) BEFORE streams stop.
+
+**Design decisions:**
+- **Publish only after first event observed.** A partition with truly
+  zero events keeps `WatermarkTracker.current() == Long.MIN_VALUE`;
+  no watermark is published. The pure-idle case still stalls — fixing
+  it needs system-time-based idle detection (advance watermark based on
+  wall-clock, not event-time), deferred to a follow-up.
+- **200ms interval.** Small enough that windows close snappily,
+  large enough that heartbeat traffic stays cheap. Configurable via
+  `TaskExecutor.WATERMARK_INTERVAL_MS` if a deployment needs to tune.
+- **Extract windowSize at dispatch, not per-message.** Regex on the
+  plan's original SQL runs once when the subscription is set up; the
+  per-message handler is a tight math expression.
+- **Single ScheduledExecutorService per agent.** Streaming tasks
+  aren't so numerous that per-task schedulers are worth it; sharing
+  one small pool keeps thread count bounded.
+- **Windowed formula: `((wm - size) / size) * size`.** Handles all
+  boundary cases (`wm == size` closes window 0; `wm < size` returns
+  MIN_VALUE sentinel meaning "no closed window yet").
 
 **Where:**
 - Planner: [`QueryPlanner.StreamingWindowedPlan`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/QueryPlanner.java) with both original + partial/combine fields; `tryPlanStreamingAggregate` delegates to `planTwoStage` for the partial/combine rewrite
