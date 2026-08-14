@@ -872,13 +872,86 @@ a clear message pointing at the deferred phase.
   cleanly via the existing cancel/interrupt path — no new
   termination logic needed.
 
-**Still deferred (phase 6d.2):**
-- **Multi-partition streaming aggregate** — cross-partition combine
-  that emits per window as all partitions' partials arrive. Needs
-  a "streaming combine" variant of the phase-2 combiner-at-driver.
+**Still deferred:**
 - **Streaming joins** — windowed joins where both sides advance
   independently.
 - **HAVING over streaming windows** — same combine issue as agg.
+- **User-alias preservation through combine** — combined windowed
+  output uses internal aliases (`g0`, `c0`) instead of the user's
+  `AS ws`/`AS n`. Same limitation as phase-2 combine. Not fixed here.
+
+## ✅ Phase 6d.2 — Multi-partition streaming aggregate (shipped)
+
+Extends phase 6d.1 to multi-partition streaming sources. Each partition
+runs the partial aggregate via jvssql streaming (per-window emission),
+driver reduces per-window partials across partitions incrementally as
+they arrive.
+
+**Plan variant refactor:** `StreamingSimplePlan` (single-partition-only,
+carried just the original SQL) → `StreamingWindowedPlan` (carries
+original SQL AND partial/combine SQL). Dispatcher picks execution shape
+based on `table.partitions().size()` — single-partition takes the
+phase-6d.1 path (original SQL, driver forwards); multi-partition takes
+the new path (partial SQL per partition, incremental cross-partition
+combine at driver).
+
+**Advance-past close detection.** No wire-level watermark plumbing —
+window closure is inferred from per-partition emission order. jvssql's
+streaming aggregate emits window {@code W}'s row only after its watermark
+advances past {@code W}'s end, so partition {@code P} emitting for
+window {@code W} implies {@code P.watermark >= W + windowSize}. A window
+{@code W} is considered globally emittable when
+{@code min(latest_emitted_window per partition) >= W}. TreeMap-backed
+buffer walks in ascending order; first not-yet-closed window terminates
+the sweep (no later entry can be closed either).
+
+**Combine math.** When a window closes, its buffered partial rows are
+fed into a fresh jvssql engine (registered as `__mesh_partial__`) that
+runs the combine SQL — same reducers as phase-2 (SUM for COUNT/SUM, MIN
+for MIN, MAX for MAX, ratio for AVG). Output rows push onto the user's
+result queue.
+
+**Termination.** On EOS from every partition, remaining buffered
+windows flush unconditionally (`drainAll=true`) then the driver emits
+its final EOS. On cancel/close, same path via `QueryHandle.close()`
+publishing `CancelMessage`.
+
+**MVP caveats:**
+- **Idle-partition stall** — a partition that never emits (e.g. source
+  quiet for that partition) blocks window closure forever. Explicit
+  watermark heartbeats on the wire would fix this; not in the MVP.
+- **User-alias loss** — combine output uses internal aliases
+  (`g0`, `c0`) instead of user's `AS ws`/`AS n`. Same limitation
+  as phase-2 combiner-at-driver.
+
+**Where:**
+- Planner: [`QueryPlanner.StreamingWindowedPlan`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/QueryPlanner.java) with both original + partial/combine fields; `tryPlanStreamingAggregate` delegates to `planTwoStage` for the partial/combine rewrite
+- Dispatcher: [`QueryDispatcher.submitStreamingMulti`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/QueryDispatcher.java) — per-partition scan dispatch + `emitClosedWindows` incremental combine + `reduceOneWindow` jvssql invocation per emit; `submitStreamingSingle` preserves the phase-6d.1 path
+- 1 new test: `WindowedStreamingTest.multiPartitionStream_combinesPerWindowAcrossPartitions` — two partitions push into shared windows, verify combined counts across partitions and unconditional flush on EOS
+
+**Design decisions:**
+- **Single plan variant, dispatcher branches.** The planner can't know
+  partition count without extra API surface; carrying both SQL flavors
+  in one plan lets the dispatcher decide at runtime with zero planner-
+  API growth. Trade-off: the plan carries some fields unused in the
+  single-partition path — small memory hit, big simplicity win.
+- **No wire protocol changes.** Same ROW/EOS/ERROR message kinds as
+  every other query shape. Watermark propagation would require a new
+  message kind — worth it if idle-partition stall becomes a real
+  problem, deferred until then.
+- **Advance-past heuristic, not min-watermark.** Without explicit
+  watermark propagation, we infer watermark from emission order. Works
+  when every partition eventually emits at least one row per window
+  (or advances past it). Falls short for truly idle partitions —
+  documented as MVP caveat.
+- **TreeMap for buffered windows.** Ordered iteration lets the emit
+  loop short-circuit at the first non-closed window (later windows
+  can't be closed if an earlier one isn't). O(log N) insert/remove
+  vs. O(N) scan-then-sort per emit.
+- **`ws <= minLatest`, not `<`.** A window {@code W} is closed once
+  every partition has emitted for {@code W} itself (not strictly
+  later). Off-by-one there would starve the common case where all
+  partitions emit for the same window and then stop.
 
 ## ⚪ Phase 7 — Storage tiers as first-class LocalTable variants
 
