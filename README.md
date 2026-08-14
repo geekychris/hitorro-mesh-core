@@ -200,6 +200,13 @@ partitions whose watermark has crossed a boundary WITHOUT emitting rows
 in the intervening windows still advance the global close detector.
 Fixes the sparse-emitter stall documented in phase 6d.2.
 
+**Phase 6d.2.2 (shipped):** idle-timeout watermarks. Closes the pure-idle
+stall (a partition with zero events, or extended quiescence). If a
+partition has been silent for longer than `hitorro.mesh.watermark.idle-timeout-ms`
+(default 30s), its watermark advances based on wall-clock. Assumes
+event-time flows at real-time rate — safe default for real-time streams;
+opt out via a very large value for backfill scenarios.
+
 **Phase 5b.2 (shipped):** N-way merge sort for `SimplePlan + ORDER BY`.
 Driver memory is O(N partitions) instead of O(total rows) — each
 partition already sorts locally (via pushdown), driver merges the

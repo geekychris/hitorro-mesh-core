@@ -965,11 +965,8 @@ rows in the intervening windows.
 - 1 new test: `WindowedStreamingTest.watermarkHeartbeats_unblockWindowClosureForSparseEmitter` — p1 events span windows 0 and 480k, p2 only events at 480k. Window 0 closes via p2's heartbeat (not via row emission) BEFORE streams stop.
 
 **Design decisions:**
-- **Publish only after first event observed.** A partition with truly
-  zero events keeps `WatermarkTracker.current() == Long.MIN_VALUE`;
-  no watermark is published. The pure-idle case still stalls — fixing
-  it needs system-time-based idle detection (advance watermark based on
-  wall-clock, not event-time), deferred to a follow-up.
+- **Publish only after first event observed** (default behaviour;
+  overridden by phase 6d.2.2 below when idle-timeout is set).
 - **200ms interval.** Small enough that windows close snappily,
   large enough that heartbeat traffic stays cheap. Configurable via
   `TaskExecutor.WATERMARK_INTERVAL_MS` if a deployment needs to tune.
@@ -982,6 +979,56 @@ rows in the intervening windows.
 - **Windowed formula: `((wm - size) / size) * size`.** Handles all
   boundary cases (`wm == size` closes window 0; `wm < size` returns
   MIN_VALUE sentinel meaning "no closed window yet").
+
+## ✅ Phase 6d.2.2 — Idle-timeout watermarks (shipped)
+
+Closes the pure-idle stall documented in phase 6d.2. A partition with
+zero events (or extended quiescence) now advances its watermark based
+on wall-clock time, so it never blocks global window emission
+indefinitely.
+
+**Two rules folded into `WatermarkTracker.currentWithIdle()`:**
+1. **Never observed anything, been running > timeout**: return
+   `system_now - idleTimeoutMs`. Assumes event-time is roughly
+   aligned with wall-clock (real-time streams).
+2. **Observed at least once, then went quiet > timeout**: return
+   `observed_max + (elapsed_since_last_observation - timeout)`.
+   The excess idle time is added to the last known watermark —
+   as if event-time flowed at real-time rate during the silence.
+
+**Configurable via `-Dhitorro.mesh.watermark.idle-timeout-ms`.**
+Default 30 seconds — long enough that momentary quiescence doesn't
+drift watermarks incorrectly, short enough that truly-idle partitions
+unblock global window emission within a reasonable window. Set to a
+very large value (or `Long.MAX_VALUE`) to disable — useful for backfill
+scenarios where event-time is arbitrary (not aligned with wall-clock).
+
+**Where:**
+- Agent: [`WatermarkTracker`](../hitorro-mesh-agent/src/main/java/com/hitorro/mesh/agent/WatermarkTracker.java) — added `idleTimeoutMs` constructor param + `currentWithIdle()` method + `lastObservationSystemMs` volatile tracking
+- Agent: `TaskExecutor.watermarkIdleTimeoutMs()` reads the system property; heartbeat scheduler calls `tracker.currentWithIdle()` (was `.current()`)
+- 9 unit tests: [`WatermarkTrackerTest`](../hitorro-mesh-agent/src/test/java/com/hitorro/mesh/agent/WatermarkTrackerTest.java) — basic observation, monotonic max, default-disabled idle, never-observed idle advance, observed-then-idle advance, re-observation resets timer, missing event-time field ignored
+
+**Design decisions:**
+- **Idle timeout disabled by default in the `(String eventTimeField)`
+  constructor** (`Long.MAX_VALUE`). Existing tests + backfill paths
+  keep the old behaviour without touching them. Only the mesh agent's
+  streaming scan path opts in via the system-property lookup.
+- **`volatile lastObservationSystemMs`, not atomic.** Read by heartbeat
+  thread, written by scan thread; monotonic long field, benign races
+  produce slightly-stale timestamps that self-correct on next scan.
+  Atomic would work too but is overkill for the read-check-decide
+  pattern.
+- **System property for the timeout, not a full config object.** Test
+  and deployment can override without any API surface; the default
+  matches the "30-second idle bound" convention common in streaming
+  systems.
+- **Wall-clock assumption is opt-in.** The default 30s is fine for
+  real-time streams. For backfill, set the property very large. The
+  javadoc calls out this assumption prominently.
+- **Skip integration-test — timing-sensitive.** Unit-test the tracker
+  logic offline; trust the phase-6d.2.1 heartbeat plumbing test to
+  cover the wire-up. An integration test with real time-based idle
+  would be flaky and add maintenance cost with no correctness gain.
 
 **Where:**
 - Planner: [`QueryPlanner.StreamingWindowedPlan`](../hitorro-mesh-driver/src/main/java/com/hitorro/mesh/driver/QueryPlanner.java) with both original + partial/combine fields; `tryPlanStreamingAggregate` delegates to `planTwoStage` for the partial/combine rewrite
