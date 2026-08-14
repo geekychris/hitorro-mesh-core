@@ -130,190 +130,244 @@ ingest and long-lived windowed aggregates.
 
 === What the mesh distributes
 
-The full distributed SQL surface. All ✅ items are shipped, tested, and
-covered by the reproducer scripts. Numbers reference the phase entries
-in `hitorro-mesh-core/ROADMAP.md`.
+[NOTE]
+====
+*Status legend* (used in every table below):
 
-[cols="3,1,3", options="header"]
+* *Shipped* — in the current v3.0.1 release; has tests; covered by
+  reproducer scripts. Not "planned," not "coming soon" — deployable now.
+* *Planned* — designed but not yet implemented.
+* *Out of scope* — deliberately not planned. Do this outside the mesh.
+
+The "since" column shows which internal milestone the feature was
+delivered under (see `hitorro-mesh-core/ROADMAP.md` for design
+decisions per milestone). Every *Shipped* row is in the release you're
+reading about.
+====
+
+[cols="4,1,1,4", options="header"]
 |===
-| SQL feature | Status | Notes
+| SQL feature | Status | Since | Notes
 
 | SELECT / WHERE / projection
-| ✅
+| *Shipped*
+| v3.0.1 (phase 1)
 | Fanned out to every partition, union at driver (`SimplePlan`)
 
 | GROUP BY + aggregates (COUNT, SUM, MIN, MAX)
-| ✅
-| Two-stage combine, driver- or worker-side (phases 2, 2.5.1)
+| *Shipped*
+| v3.0.1 (phases 2, 2.5.1)
+| Two-stage combine, driver- or worker-side
 
 | AVG
-| ✅
-| Decomposes to SUM+COUNT partials, driver reconstructs (phase 3)
+| *Shipped*
+| v3.0.1 (phase 3)
+| Decomposes to SUM+COUNT partials, driver reconstructs
 
 | HAVING
-| ✅
-| Rewritten to reference combine-side aliases (phase 3)
+| *Shipped*
+| v3.0.1 (phase 3)
+| Rewritten to reference combine-side aliases
 
 | SELECT DISTINCT
-| ✅
-| Auto-rewrites to GROUP BY on all selected cols (phase 3)
+| *Shipped*
+| v3.0.1 (phase 3)
+| Auto-rewrites to GROUP BY on all selected columns
 
 | LIMIT — with pushdown to agents
-| ✅
-| Each partition returns at most N rows (phase 5b.3)
+| *Shipped*
+| v3.0.1 (phase 5b.3)
+| Each partition returns at most N rows
 
 | ORDER BY — with N-way merge sort
-| ✅
-| Bounded-memory sort across partitions (phase 5b.2)
+| *Shipped*
+| v3.0.1 (phase 5b.2)
+| Bounded-memory sort across partitions
 
 | Broadcast JOIN — INNER, LEFT, RIGHT, FULL OUTER
-| ✅
-| Small dimension table replicated to every agent (phases 4a, 4c)
+| *Shipped*
+| v3.0.1 (phases 4a, 4c)
+| Small dimension table replicated to every agent
 
 | Shuffle-hash JOIN — INNER, LEFT, RIGHT, FULL OUTER
-| ✅
-| Fact × fact between two distributed tables (phases 4b, 4c.1)
+| *Shipped*
+| v3.0.1 (phases 4b, 4c.1)
+| Fact × fact between two distributed tables
 
 | Shuffle-hash JOIN + WHERE (per-side pushdown)
-| ✅
-| Single-side conjuncts filter pre-shuffle (phases 4b.1, 4b.2.1)
+| *Shipped*
+| v3.0.1 (phases 4b.1, 4b.2.1)
+| Single-side conjuncts filter pre-shuffle
 
 | Shuffle-hash JOIN + GROUP BY / aggregates
-| ✅
-| Three-stage combine (partial-agg per bucket → driver merge) (phase 4b.2)
+| *Shipped*
+| v3.0.1 (phase 4b.2)
+| Three-stage combine (partial-agg per bucket → driver merge)
 
 | Global aggregate over JOIN (no GROUP BY)
-| ✅
+| *Shipped*
+| v3.0.1
 | Single-row result from a joined fact table
 
 | Windowed aggregate — batch source
-| ✅
-| `WIN_START` in GROUP BY (phase 6d)
+| *Shipped*
+| v3.0.1 (phase 6d)
+| `WIN_START` in GROUP BY
 
 | Windowed aggregate — streaming source (single partition)
-| ✅
-| Incremental emit as watermarks advance (phase 6d.1)
+| *Shipped*
+| v3.0.1 (phase 6d.1)
+| Incremental emit as watermarks advance
 
 | Windowed aggregate — streaming source (multi-partition)
-| ✅
-| Cross-partition combine with advance-past close detection (phase 6d.2)
+| *Shipped*
+| v3.0.1 (phase 6d.2)
+| Cross-partition combine with advance-past close detection
 
 | Watermark heartbeats
-| ✅
-| Sparse-emitter partitions still advance global close (phase 6d.2.1)
+| *Shipped*
+| v3.0.1 (phase 6d.2.1)
+| Sparse-emitter partitions still advance global close
 
 | Idle-timeout watermarks
-| ✅
-| Truly-idle partitions don't stall (phase 6d.2.2)
+| *Shipped*
+| v3.0.1 (phase 6d.2.2)
+| Truly-idle partitions don't stall
 
 | User-alias preservation through combine
-| ✅
-| `SELECT lang AS L, COUNT(*) AS n` returns `L`, `n` not `g0`, `c0` (phase 6d.2.3)
+| *Shipped*
+| v3.0.1 (phase 6d.2.3)
+| `SELECT lang AS L, COUNT(*) AS n` returns `L`, `n` not `g0`, `c0`
 
 | Streaming JOIN (two streaming sources, windowed)
-| 🔵 Planned
-| Phase 8 — biggest remaining SQL gap
+| *Planned*
+| phase 8 (not in v3.0.1)
+| Biggest remaining SQL gap
 
 | Subqueries / CTEs / OVER PARTITION BY / PIVOT
-| ❌
-| Out of scope. Run these against a single jvssql engine.
+| *Out of scope*
+| —
+| Run these against a single jvssql engine
 |===
 
 === What the mesh gives you beyond SQL
 
-Not usually featured in an SQL-engine comparison, but part of the mesh's
-production story.
+Not usually featured in an SQL-engine comparison, but part of the
+mesh's production story. Same status legend as the previous table —
+everything below marked *Shipped* is in v3.0.1 you can deploy today.
 
-[cols="3,1,3", options="header"]
+[cols="4,1,1,3", options="header"]
 |===
-| Capability | Status | Notes
+| Capability | Status | Since | Notes
 
 | Batch REST endpoint (`POST /mesh/queries`)
-| ✅
+| *Shipped*
+| v3.0.1
 | Submit + collect, JSON in/out
 
 | Streaming REST endpoint (`GET /mesh/queries/stream`, SSE)
-| ✅
+| *Shipped*
+| v3.0.1 (phase 6c.1)
 | Row-at-a-time push to browser / any HTTP client
 
 | Explicit cancel (`DELETE /mesh/queries/{queryId}`)
-| ✅
-| Interrupts in-flight agent tasks; idempotent (phase 7d)
+| *Shipped*
+| v3.0.1 (phase 7d)
+| Interrupts in-flight agent tasks; idempotent
 
 | Query timeout with clean cancel propagation
-| ✅
-| Deadline armed at submit; `timedOut` flag on response (phase 7b)
+| *Shipped*
+| v3.0.1 (phase 7b)
+| Deadline armed at submit; `timedOut` flag on response
 
 | Whole-query retry with exponential backoff
-| ✅
-| Configurable per-request via `retries` field (phase 7g)
+| *Shipped*
+| v3.0.1 (phase 7g)
+| Configurable per-request via `retries` field
 
 | Task-level surgical retry (per partition, on error)
-| ✅
-| Retries only failed partition if no rows emitted yet (phase 7k)
+| *Shipped*
+| v3.0.1 (phase 7k)
+| Retries only failed partition if no rows emitted yet
 
 | Backpressure with drop metric
-| ✅
-| Bounded result queue, non-fatal overflow (phase 7i)
+| *Shipped*
+| v3.0.1 (phase 7i)
+| Bounded result queue, non-fatal overflow
 
 | Structured typed error responses (JSON)
-| ✅
-| `QueryTimeoutException` → 408, `AgentTaskException` → 502, etc. (phase 7c)
+| *Shipped*
+| v3.0.1 (phase 7c)
+| `QueryTimeoutException` → 408, `AgentTaskException` → 502, etc.
 
 | EXPLAIN endpoint (`GET /mesh/queries/explain`)
-| ✅
-| See the plan without executing (phase 7h)
+| *Shipped*
+| v3.0.1 (phase 7h)
+| See the plan without executing
 
 | List active queries (`GET /mesh/queries`)
-| ✅
-| Operator visibility (phase 7d)
+| *Shipped*
+| v3.0.1 (phase 7d)
+| Operator visibility
 
 | TLS transport
-| ✅
-| PKCS12 truststore, custom trust anchor (phase 7a)
+| *Shipped*
+| v3.0.1 (phase 7a)
+| PKCS12 truststore, custom trust anchor
 
 | Mutual TLS (mTLS)
-| ✅
-| Client cert via keystore (phase 7a)
+| *Shipped*
+| v3.0.1 (phase 7a)
+| Client cert via keystore
 
 | NATS auth — .creds / token / user-pass
-| ✅
-| Precedence: creds > token > user/pass (phase 7a)
+| *Shipped*
+| v3.0.1 (phase 7a)
+| Precedence: creds > token > user/pass
 
 | Prometheus metrics — driver-side
-| ✅
+| *Shipped*
+| v3.0.1
 | Query timers, agent count, table count, backpressure
 
 | Prometheus metrics — agent-side
-| ✅
-| Per-agent task + row + watermark counters (phase 7m)
+| *Shipped*
+| v3.0.1 (phase 7m)
+| Per-agent task + row + watermark counters
 
 | Spring Boot HealthIndicator with per-partition coverage
-| ✅
-| Composite `/actuator/health` reports OUT_OF_SERVICE for uncovered shards (phase 7j)
+| *Shipped*
+| v3.0.1 (phase 7j)
+| Composite `/actuator/health` reports OUT_OF_SERVICE for uncovered shards
 
 | Streaming source adapters — Kafka, NATS JetStream
-| ✅
-| Config-driven in agent YAML (phase 6b.1)
+| *Shipped*
+| v3.0.1 (phase 6b.1)
+| Config-driven in agent YAML
 
 | In-memory streaming source (dev / tests)
-| ✅
+| *Shipped*
+| v3.0.1 (phase 6a)
 | `InMemoryStreamingTable.pushRow/stop`
 
 | Kubernetes deploy via Helm chart
-| ✅
-| Hardened: securityContext, PDB, split probes, TLS values (phase 7e)
+| *Shipped*
+| v3.0.1 (phase 7e)
+| Hardened: securityContext, PDB, split probes, TLS values
 
 | Docker Compose deploy
-| ✅
-| 5-container stack; images non-root + healthcheck (phase 7e)
+| *Shipped*
+| v3.0.1 (phase 7e)
+| 5-container stack; images non-root + healthcheck
 
 | Orion (Rust runtime) deploy path
-| ✅
+| *Shipped*
+| v3.0.1
 | Alternative to K8s; capability-aware native binaries
 
 | Embeddable in a Spring Boot app
-| ✅
+| *Shipped*
+| v3.0.1
 | Everything is a POJO/Spring bean; in-memory transport for tests
 |===
 
