@@ -254,6 +254,7 @@ NATS connectivity, and TLS config.
 
 ## Where to next
 
+- **Comprehensive user guide** (PDF/HTML with diagrams): [`docs/user-guide/`](docs/user-guide/) — run `./build.sh` to render
 - Full feature list + design decisions: [ROADMAP.md](ROADMAP.md)
 - Architecture overview: [ARCHITECTURE.md](ARCHITECTURE.md)
 - REST API summary: [`MeshRestController`](../hitorro-mesh-driver-app/src/main/java/com/hitorro/mesh/driver/app/MeshRestController.java)

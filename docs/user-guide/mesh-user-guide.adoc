@@ -1,0 +1,1031 @@
+= Hitorro Mesh User Guide
+Chris Collins <chris@hitorro.com>
+v3.0.1, 2026-08-13
+:doctype: book
+:toc: left
+:toclevels: 3
+:sectnums:
+:sectnumlevels: 3
+:icons: font
+:source-highlighter: rouge
+:imagesdir: images
+:diagram-svg-type: inline
+
+// asciidoctor-diagram must be loaded on the command line:
+//   asciidoctor-pdf -r asciidoctor-diagram mesh-user-guide.adoc
+//   asciidoctor     -r asciidoctor-diagram mesh-user-guide.adoc
+// See build.sh for a Docker-based renderer that has this preloaded.
+
+[preface]
+== About this guide
+
+Hitorro Mesh is a **Spark-like distributed SQL engine** built on the Hitorro
+stack. It layers per-partition query execution (jvssql), a wire-transport
+SPI (NATS by default), and a coordinating driver over an already-existing
+JSON-typed data platform. This guide walks through the mesh from three angles:
+
+* **Architecture** — the components, how they interact, the wire protocol,
+  the plan variants the driver picks between.
+* **Tutorial** — a start-to-finish walkthrough spanning four deployment
+  tiers (in-JVM, local NATS, docker-compose, Kubernetes).
+* **Reference + operations** — SQL cheat sheet, configuration knobs,
+  observability, troubleshooting, common recipes.
+
+By the end you should be able to design a query, pick the right deployment
+tier, and diagnose the top-10 failure modes without opening the source.
+
+<<<
+
+= Part I — Architecture
+
+== What the mesh is (and isn't)
+
+**What it is.** A thin coordination layer that takes a SQL query at the
+driver, splits it into per-partition tasks, dispatches them to a fleet of
+agent JVMs over NATS, and merges results back to the client. Each agent
+runs an embedded jvssql engine over its local slice of data. The mesh
+speaks JSON on the wire (JVS-typed documents), doesn't require a shared
+storage layer, and treats every module as an independent Git repo /
+Maven artifact.
+
+**What it isn't.** A full replacement for Spark or Flink. It doesn't have
+a fault-tolerant distributed cache, a lineage-tracking DAG optimizer, a
+Python or R client, or years of SQL query-optimizer tuning. It is
+**purpose-built for Hitorro-shape workloads**: querying typed JSON
+documents across horizontally-sharded stores.
+
+**Design principles:**
+
+* **Modular by default** — every capability (streaming, orion, k8s, kafka
+  adapter) lives in its own optional module.
+* **Wire-narrow** — the transport SPI has exactly two methods (publish,
+  subscribe). That's enough to add a new transport with ~100 lines of code.
+* **Pluggable plan variants** — a sealed `Plan` interface with one variant
+  per execution shape. Adding a new shape means adding a new sealed subclass
+  + a dispatcher method.
+* **Fail-visible not fail-fast** — typed exceptions, an EXPLAIN endpoint,
+  a health indicator with per-partition detail. Operators can see WHY a
+  query failed without grep'ing logs.
+
+<<<
+
+== High-level architecture
+
+A mesh consists of one driver process and N agent processes, all talking
+over NATS. Clients submit SQL to the driver's REST endpoint; the driver
+plans + dispatches; agents execute + return results.
+
+[plantuml, mesh-architecture, svg]
+....
+@startuml
+skinparam componentStyle rectangle
+skinparam backgroundColor transparent
+skinparam defaultFontName Helvetica
+
+package "Client" {
+  [REST client]
+  [SSE consumer]
+}
+
+cloud "NATS broker\n(TLS optional)" as nats
+
+package "Driver JVM" {
+  [MeshRestController] as rest
+  [QueryDispatcher] as dispatcher
+  [QueryPlanner] as planner
+  [LiveAgentRegistry] as agentReg
+  [DistributedTableRegistry] as tableReg
+  [MeshHealthIndicator] as health
+}
+
+package "Agent JVM (US shard)" as agentUs {
+  [MeshAgent US]
+  [TaskExecutor US]
+  [jvssql engine US]
+  [LocalTable(s) US]
+}
+
+package "Agent JVM (EU shard)" as agentEu {
+  [MeshAgent EU]
+  [TaskExecutor EU]
+  [jvssql engine EU]
+  [LocalTable(s) EU]
+}
+
+[REST client] --> rest : POST /mesh/queries
+[SSE consumer] --> rest : GET /mesh/queries/stream
+rest --> dispatcher
+dispatcher --> planner : plan(sql, tables)
+planner --> tableReg
+dispatcher --> agentReg : pick agents
+dispatcher --> nats : publish TaskDescriptor
+nats --> agentUs : mesh.agent.task.us
+nats --> agentEu : mesh.agent.task.eu
+agentUs --> nats : ResultMessage(ROW/EOS/ERROR/WATERMARK)
+agentEu --> nats : ResultMessage(ROW/EOS/ERROR/WATERMARK)
+nats --> dispatcher : mesh.query.result.<queryId>
+health --> agentReg
+health --> tableReg
+
+@enduml
+....
+
+**Roles:**
+
+* **Client** — anything that speaks HTTP. Batch mode sends a POST and
+  waits; streaming mode holds an SSE connection open. The client can also
+  cancel via DELETE.
+* **Driver** — one per mesh. Owns the query planner, the agent registry
+  (agents heartbeat to it), the distributed-table registry (what's queryable),
+  and the REST surface. Stateless with respect to query state; can be
+  restarted without losing data (queries in flight fail, retry-on-client if
+  configured).
+* **Agents** — N per mesh. Each agent declares its capabilities
+  (`jvssql`, `partition:docs:us`, etc.) and heartbeats to NATS. When a task
+  arrives, it's executed against the agent's `LocalTable` set and results
+  publish back.
+* **NATS** — the only cross-process communication path. Uses subject
+  conventions (see next section). Optional TLS + auth via
+  `NatsSecurityProperties`.
+
+<<<
+
+== Wire protocol
+
+The mesh's wire surface is deliberately narrow — five message types on
+four well-known subject patterns.
+
+=== Message types
+
+[cols="1,3", options="header"]
+|===
+| Type | Purpose
+
+| `HeartbeatMessage`
+| Agent → driver, periodic. Announces the agent is alive with its
+  current capability set.
+
+| `TaskDescriptor`
+| Driver → specific agent. Carries the SQL to run, source table + partition
+  key, required capabilities, result subject, optional shuffle spec,
+  optional combine spec.
+
+| `ResultMessage`
+| Agent → driver. Four kinds: `ROW` (a result document), `EOS`
+  (end-of-stream for this partition), `ERROR` (agent-side failure),
+  `WATERMARK` (streaming heartbeat with max observed event-time).
+
+| `CancelMessage`
+| Driver → all agents for a query. Interrupts in-flight tasks for that
+  queryId; agents publish EOS + cleanup.
+
+| `AgentDescriptor`
+| Driver-side record derived from `HeartbeatMessage` — what the driver knows
+  about each live agent.
+|===
+
+=== Subject conventions
+
+[cols="1,2", options="header"]
+|===
+| Subject pattern | Direction / purpose
+
+| `mesh.agent.heartbeat.<agentId>`
+| Agent → driver (via wildcard subscription `mesh.agent.heartbeat.*`)
+
+| `mesh.agent.task.<agentId>`
+| Driver → specific agent
+
+| `mesh.query.result.<queryId>.<partitionKey>`
+| Agent → driver (driver subscribes to `mesh.query.result.<queryId>.*`)
+
+| `mesh.query.control.<queryId>`
+| Driver → agents (cancel signal)
+
+| `mesh.query.shuffle.<queryId>[.<sideLabel>].<bucket>`
+| Agent → agent (shuffle-hash join / distributed combine)
+|===
+
+=== Query lifecycle sequence
+
+A batch SimplePlan query — the simplest shape.
+
+[plantuml, query-lifecycle-simple, svg]
+....
+@startuml
+skinparam sequenceMessageAlign center
+skinparam backgroundColor transparent
+skinparam defaultFontName Helvetica
+
+actor Client
+participant "REST\ncontroller" as REST
+participant "Query\nDispatcher" as D
+database NATS
+participant "Agent US" as AU
+participant "Agent EU" as AE
+
+Client -> REST : POST /mesh/queries\n{"sql":"SELECT id FROM docs WHERE lang='en'"}
+REST -> D : submit(sql, timeout)
+D -> D : QueryPlanner.plan → SimplePlan
+D -> NATS : subscribe mesh.query.result.<qid>.*
+D -> NATS : publish TaskDescriptor(us)
+D -> NATS : publish TaskDescriptor(eu)
+NATS -> AU : mesh.agent.task.us
+NATS -> AE : mesh.agent.task.eu
+
+par
+  AU -> AU : jvssql compile + run on local docs.us
+  AU -> NATS : ResultMessage.row × N
+  AU -> NATS : ResultMessage.eos
+also
+  AE -> AE : jvssql compile + run on local docs.eu
+  AE -> NATS : ResultMessage.row × M
+  AE -> NATS : ResultMessage.eos
+end
+
+NATS -> D : rows + EOS from both partitions
+D -> REST : QueryResponse{rows, timedOut, attempts}
+REST -> Client : 200 OK JSON
+
+@enduml
+....
+
+<<<
+
+== Plan variants
+
+The `QueryPlanner` picks one of five sealed `Plan` subtypes based on the
+SQL + registered tables.
+
+[plantuml, plan-hierarchy, svg]
+....
+@startuml
+skinparam classAttributeIconSize 0
+skinparam backgroundColor transparent
+skinparam defaultFontName Helvetica
+
+interface "sealed Plan" as Plan {
+  + String tableName()
+}
+
+class SimplePlan {
+  + String tableName
+}
+
+class TwoStagePlan {
+  + String tableName
+  + String partialSql
+  + String combineSql
+  + List<String> groupColumns
+  + List<PartialColumn> partialColumns
+}
+
+class ShuffleJoinPlan {
+  + String tableName / leftTable / rightTable
+  + String leftKey / rightKey
+  + JoinKind joinKind
+  + String originalSql
+}
+
+class ShuffleJoinAggregatePlan {
+  + String tableName / leftTable / rightTable
+  + JoinKind joinKind
+  + String partialSql / combineSql
+  + List<String> groupColumns
+  + List<PartialColumn> partialColumns
+}
+
+class StreamingWindowedPlan {
+  + String tableName
+  + String originalSql       (single-partition path)
+  + String partialSql        (multi-partition path)
+  + String combineSql        (multi-partition path)
+  + List<String> groupColumns
+  + List<PartialColumn> partialColumns
+}
+
+Plan <|.. SimplePlan
+Plan <|.. TwoStagePlan
+Plan <|.. ShuffleJoinPlan
+Plan <|.. ShuffleJoinAggregatePlan
+Plan <|.. StreamingWindowedPlan
+
+@enduml
+....
+
+**Selection rules** (in order):
+
+. Streaming source + `WIN_START` in `GROUP BY` → `StreamingWindowedPlan`
+  (dispatcher branches on partition count).
+. Two-distributed-table JOIN detected (`FROM a JOIN b ON a.k = b.k`):
+  * With `GROUP BY` / aggregate → `ShuffleJoinAggregatePlan`
+  * Otherwise → `ShuffleJoinPlan`
+. `GROUP BY` / aggregate / `SELECT DISTINCT` → `TwoStagePlan`
+. Otherwise → `SimplePlan`
+
+<<<
+
+== Shuffle-hash join execution
+
+The most complex plan shape. Both sides shuffled by their join key into
+matching buckets; per-bucket combine workers do the actual join.
+
+[plantuml, shuffle-hash-join, svg]
+....
+@startuml
+skinparam sequenceMessageAlign center
+skinparam backgroundColor transparent
+skinparam defaultFontName Helvetica
+
+participant "Query\nDispatcher" as D
+participant "Agent A\n(scan docs)" as SA
+participant "Agent B\n(scan events)" as SB
+participant "Agent C\n(combine bucket 0)" as CA
+participant "Agent D\n(combine bucket 1)" as CB
+
+== Stage 1: combines subscribe first ==
+D -> CA : TaskDescriptor(stage=1, combine bucket 0)
+D -> CB : TaskDescriptor(stage=1, combine bucket 1)
+CA -> CA : subscribe mesh.query.shuffle.<qid>.left.0\n              + .right.0
+CB -> CB : subscribe mesh.query.shuffle.<qid>.left.1\n              + .right.1
+
+== Stage 0: scan + shuffle ==
+D -> SA : TaskDescriptor(stage=0, scan docs, shuffleSpec left)
+D -> SB : TaskDescriptor(stage=0, scan events, shuffleSpec right)
+SA -> CA : rows for bucket 0 (hash(docs.id) mod 2 == 0)
+SA -> CB : rows for bucket 1
+SA -> D : partition EOS
+SB -> CA : rows for bucket 0
+SB -> CB : rows for bucket 1
+SB -> D : partition EOS
+
+== Stage 1 execution ==
+CA -> CA : join SQL runs locally over both buffers
+CA -> D : result rows + EOS
+CB -> CB : join SQL runs locally over both buffers
+CB -> D : result rows + EOS
+
+@enduml
+....
+
+**When both sides shuffle** (as shown), each combine worker sees only
+matching join keys from BOTH tables — perfect for a hash join. The
+`CombineSpec` carries per-side type JSON (phase 4c.1) so empty buckets
+can register a typed-but-empty stream for OUTER JOIN semantics.
+
+**With aggregates** (`ShuffleJoinAggregatePlan`), stage 1 emits partial
+aggregate rows; stage 2 runs at the driver to reduce partials across
+buckets.
+
+<<<
+
+== Streaming windowed aggregate
+
+Long-lived query. Windows emit incrementally as watermarks advance;
+never a synthetic EOS until cancel or source-EOS.
+
+[plantuml, streaming-windowed, svg]
+....
+@startuml
+skinparam sequenceMessageAlign center
+skinparam backgroundColor transparent
+skinparam defaultFontName Helvetica
+
+participant "Query\nDispatcher" as D
+participant "Agent P1\n(streaming scan)" as P1
+participant "Agent P2\n(streaming scan)" as P2
+
+D -> D : plan → StreamingWindowedPlan
+D -> P1 : TaskDescriptor(partialSql, streaming)
+D -> P2 : TaskDescriptor(partialSql, streaming)
+
+P1 -> P1 : register source w/ StreamConfig(eventTimeField)
+P1 -> P1 : jvssql auto-picks StreamingAggregate
+P2 -> P2 : same
+
+loop each observed event
+  P1 -> P1 : WatermarkTracker.observe(event_time)
+  P1 -> D : ResultMessage.watermark (every 200ms)
+end
+
+loop each closed window
+  P1 -> D : ResultMessage.row(g0=windowStart, __c0__=partialCount)
+  P2 -> D : ResultMessage.row(g0=windowStart, __c0__=partialCount)
+  D -> D : buffer per (window,group); advance partitionLatestWindow
+  D -> D : if min(latestWindow) ≥ W, run combineSql on buffered partials
+  D -> "Client (SSE)" : combined row {ws, n}
+end
+
+... source runs indefinitely ...
+
+D -> P1 : mesh.query.control.<qid> (CancelMessage on client close/deadline)
+D -> P2 : same
+P1 -> D : final EOS
+P2 -> D : final EOS
+D -> "Client (SSE)" : complete event
+
+@enduml
+....
+
+**Idle-timeout safeguard** — a partition with zero events (or extended
+silence) still advances its watermark based on wall-clock, so a global
+window doesn't stall on one idle partition. See
+`hitorro.mesh.watermark.idle-timeout-ms` (default 30s).
+
+<<<
+
+= Part II — Getting started (tutorial)
+
+== Prerequisites checklist
+
+Before starting, you need:
+
+[cols="1,3", options="header"]
+|===
+| Tier | Prereqs
+
+| 1 (in-JVM)
+| Java 21, Maven 3.9+, `git`
+
+| 2 (local NATS)
+| Tier 1 + `nats-server` binary on `$PATH`
+
+| 3 (docker-compose)
+| Tier 1 + Docker (or Podman with compose alias)
+
+| 4 (Kubernetes)
+| Tier 1 + `kubectl` + `helm` + a K8s cluster + image registry
+|===
+
+You also need a working clone of the mesh repos:
+
+[source,bash]
+----
+git clone git@github.com:geekychris/hitorro-all.git
+cd hitorro-all
+./checkout-modules.sh   # clones every hitorro-mesh-* + supporting repo
+mvn install -DskipTests
+----
+
+<<<
+
+== Tier 1 — Run the mesh in one JVM (30 seconds)
+
+Everything in-process; NATS is replaced by `InMemoryMeshTransport`. Useful
+for embedding the mesh in your own Spring Boot app or writing unit tests.
+
+[source,bash]
+----
+cd hitorro-mesh-examples
+mvn test -Dtest=EndToEndTest
+----
+
+Green output = you just ran 4 real distributed queries (WHERE, GROUP BY,
+JOIN, LIMIT) with 2 in-memory agents. See
+`hitorro-mesh-examples/src/test/java/com/hitorro/mesh/examples/EndToEndTest.java`
+for the exact wiring pattern to embed the mesh in your own code:
+
+[source,java]
+----
+MeshTransport transport = new InMemoryMeshTransport();
+DistributedTableRegistry tables = new DistributedTableRegistry();
+tables.register(myDistributedTable);          // 2+ partitions
+MeshDriver driver = new MeshDriver(transport, tables, /*agentExpiryMs*/ 10_000);
+driver.start();
+
+MeshAgent agent = new MeshAgent(transport, new AgentConfig(
+        "agent-1",
+        Set.of("jvssql", "partition:docs:us"),
+        Duration.ofMillis(100),
+        List.of(myLocalTable)));
+agent.start();
+
+// ... submit queries ...
+try (var h = driver.dispatcher().submit("SELECT id FROM docs")) {
+    List<JsonNode> rows = h.collect(5, TimeUnit.SECONDS);
+    // ...
+}
+----
+
+<<<
+
+== Tier 2 — Local NATS (5 minutes)
+
+Real network hops, real Spring Boot fat JARs, all on your laptop. Uses
+the reproducer scripts in `hitorro-mesh-examples/scripts/`.
+
+**Setup:**
+
+[source,bash]
+----
+# 1. Get nats-server on PATH (macOS example)
+brew install nats-server
+
+# 2. Build the fat JARs
+mvn -pl hitorro-mesh-driver-app,hitorro-mesh-agent-app install -DskipTests
+
+# 3. Bring the mesh up
+cd hitorro-mesh-examples/scripts
+./mesh-init-data.sh     # writes sample data + configs under /tmp/hitorro-mesh-smoke
+./mesh-up.sh            # boots nats + driver + 2 agents in the background
+./mesh-status.sh        # verify agents registered
+----
+
+**Query it:**
+
+[source,bash]
+----
+./mesh-query.sh "SELECT id, title FROM docs WHERE lang = 'en'"
+# Or POST directly to the REST endpoint:
+curl -s -X POST http://localhost:8085/mesh/queries \
+  -H 'Content-Type: application/json' \
+  -d '{"sql":"SELECT lang, COUNT(*) FROM docs GROUP BY lang","timeoutMs":5000}' | jq .
+----
+
+**Streaming (SSE):**
+
+[source,bash]
+----
+curl -N 'http://localhost:8085/mesh/queries/stream?sql=SELECT+id+FROM+docs+WHERE+lang=%27en%27'
+# → event: opened  data: {"queryId":"...", "assignedAgents":[...]}
+# → event: row     data: {"id":"us-1", ...}
+# → event: row     data: {"id":"us-2", ...}
+# → event: complete data: {"queryId":"...", "rowCount":4}
+----
+
+**Tear down:**
+
+[source,bash]
+----
+./mesh-down.sh
+----
+
+**All-in-one self-asserting smoke:**
+
+[source,bash]
+----
+./mesh-smoke.sh         # init → up → query → assert → down. Exit 0 = pass.
+./mesh-tls-smoke.sh     # same, but TLS-secured NATS + PKCS12 truststore
+./mesh-mtls-smoke.sh    # + mutual TLS (client cert)
+----
+
+<<<
+
+== Tier 3 — Docker compose (15 minutes)
+
+Five containers on one Docker network — `nats` + driver + 3 agents.
+
+**Setup:**
+
+[source,bash]
+----
+cd hitorro-mesh-examples/docker
+docker compose up -d --build
+docker compose ps               # driver + 3 agents show "Up (healthy)"
+----
+
+Images are production-hardened (phase 7e): non-root user (uid 1000),
+tuned JVM opts, HEALTHCHECK against `/actuator/health`.
+
+**Override JVM heap at runtime:**
+
+[source,bash]
+----
+JAVA_OPTS='-Xmx8g -XX:MaxGCPauseMillis=100' docker compose up -d
+----
+
+<<<
+
+== Tier 4 — Kubernetes production deploy
+
+Uses the Helm chart at `hitorro-mesh-k8s/helm/hitorro-mesh`.
+
+**Publish images to your registry:**
+
+[source,bash]
+----
+docker build -f hitorro-mesh-examples/docker/Dockerfile.driver \
+             -t your-registry/hitorro-mesh-driver:3.0.1 .
+docker build -f hitorro-mesh-examples/docker/Dockerfile.agent \
+             -t your-registry/hitorro-mesh-agent:3.0.1 .
+docker push your-registry/hitorro-mesh-driver:3.0.1
+docker push your-registry/hitorro-mesh-agent:3.0.1
+----
+
+**Install the chart:**
+
+[source,bash]
+----
+cd hitorro-mesh-k8s/helm
+helm install mesh ./hitorro-mesh \
+    --set driver.image.repository=your-registry/hitorro-mesh-driver \
+    --set agent.image.repository=your-registry/hitorro-mesh-agent \
+    --set nats.url=nats://nats.nats.svc.cluster.local:4222
+----
+
+**With TLS + mTLS to a secured NATS:**
+
+[source,yaml]
+----
+# my-values.yaml
+nats:
+  url: "tls://nats.internal:4222"
+  security:
+    tls: true
+    trustStorePath: /secrets/ca.p12
+    trustStorePassword: changeit
+    keyStorePath: /secrets/client.p12
+    keyStorePassword: changeit
+    credentialsFile: /secrets/mesh.creds
+driver:
+  pdb:
+    enabled: true
+    minAvailable: 1
+  ingress:
+    enabled: true
+    className: nginx
+    host: mesh.your-domain.com
+----
+
+Chart features (all phase 7e-hardened):
+
+* Pod securityContext (runAsNonRoot 1000, fsGroup)
+* Container capabilities dropped
+* Split liveness (`/actuator/health/liveness`) + readiness
+  (`/actuator/health` including `MeshHealthIndicator`) probes
+* Optional PodDisruptionBudget
+* Downward API for agent capability annotations
+* nats-security block generation from values
+
+<<<
+
+= Part III — Query language
+
+== SQL cheat sheet
+
+Everything the mesh distributes.
+
+[cols="2,3", options="header"]
+|===
+| Shape | Example
+
+| Filter + projection
+| `SELECT id, title FROM docs WHERE lang = 'en'`
+
+| GROUP BY + aggregate
+| `SELECT lang, COUNT(*) FROM docs GROUP BY lang`
+
+| DISTINCT
+| `SELECT DISTINCT lang FROM docs`
+
+| HAVING
+| `SELECT lang, COUNT(*) c FROM docs GROUP BY lang HAVING c > 10`
+
+| AVG (decomposes to SUM+COUNT partials internally)
+| `SELECT lang, AVG(size_kb) FROM docs GROUP BY lang`
+
+| LIMIT + ORDER BY (with pushdown)
+| `SELECT id FROM docs ORDER BY size_kb DESC LIMIT 10`
+
+| Broadcast INNER JOIN
+| `SELECT d.id, l.name FROM docs d JOIN langs l ON d.lang = l.code`
+
+| Broadcast OUTER JOIN
+| `SELECT d.id, l.name FROM docs d LEFT JOIN langs l ON d.lang = l.code`
+
+| Shuffle-hash JOIN (both sides distributed)
+| `SELECT d.id, e.action FROM docs d JOIN events e ON d.id = e.doc_id`
+
+| Shuffle-hash + WHERE (per-side pushdown)
+| `... WHERE d.title = 'X' AND e.action = 'view'`
+
+| Shuffle-hash + GROUP BY
+| `SELECT d.lang, COUNT(*) FROM docs d JOIN events e ON d.id = e.doc_id GROUP BY d.lang`
+
+| Global aggregate
+| `SELECT COUNT(*) FROM docs JOIN events ON ...`
+
+| Windowed aggregate (batch or streaming source)
+| `SELECT WIN_START(event_time, 60000) ws, COUNT(*) n FROM events GROUP BY WIN_START(event_time, 60000)`
+|===
+
+**Aliases:** the mesh preserves `AS foo` aliases through combine SQL
+(phase 6d.2.3). `SELECT lang AS L, COUNT(*) AS cnt` returns columns
+named `L` and `cnt`, not internal `g0` / `c0`.
+
+**Not distributed (yet):** streaming JOIN between two streaming sources,
+subqueries, window functions (`OVER PARTITION BY`), pivot / unpivot.
+
+<<<
+
+== Common use cases
+
+=== Real-time metrics dashboard
+
+Streaming source (Kafka topic of events) → windowed aggregate → SSE to a
+dashboard.
+
+[source,sql]
+----
+SELECT
+    WIN_START(event_time, 60000) AS window_start,
+    region,
+    COUNT(*)                     AS requests,
+    AVG(latency_ms)              AS avg_latency
+FROM  events
+GROUP BY WIN_START(event_time, 60000), region
+----
+
+Client consumes via SSE:
+
+[source,bash]
+----
+curl -N "http://mesh/mesh/queries/stream?sql=$(python3 -c 'import urllib.parse,sys; print(urllib.parse.quote(sys.stdin.read()))' <<'SQL'
+SELECT WIN_START(event_time,60000) window_start, region, COUNT(*) requests
+FROM events GROUP BY WIN_START(event_time,60000), region
+SQL
+)"
+----
+
+Each minute-window's aggregate row arrives as an SSE event as its
+watermark passes.
+
+=== Cross-shard reporting query
+
+Docs sharded by region across N agents; report language coverage globally.
+
+[source,sql]
+----
+SELECT lang, COUNT(*), AVG(size_kb)
+FROM   docs
+WHERE  size_kb > 10
+GROUP BY lang
+ORDER BY 2 DESC
+LIMIT  20
+----
+
+Executes as a `TwoStagePlan`: partial aggregates per partition (WHERE
+applied pre-shuffle), driver-side combine sums COUNT and re-averages
+via SUM/COUNT decomposition, ORDER BY + LIMIT applied post-combine.
+
+=== Enrich a fact table with a dimension
+
+Events (distributed) joined with a small lookup (broadcast).
+
+[source,bash]
+----
+# One-time broadcast registration in driver.yml:
+hitorro:
+  mesh:
+    driver:
+      broadcast-tables: [langs]
+
+# Every agent pre-loads the broadcast in its own config:
+hitorro:
+  mesh:
+    agent:
+      broadcast-tables:
+        - name: langs
+          type-json-resource: file:/config/types/langs.json
+          ndjson-file: file:/data/langs.ndjson
+----
+
+[source,sql]
+----
+SELECT e.doc_id, l.name AS lang_name, COUNT(*) AS hits
+FROM   events e JOIN langs l ON e.lang_code = l.code
+GROUP BY e.doc_id, l.name
+----
+
+=== Two fact tables joined
+
+Both sides sharded — shuffle-hash join, optionally with GROUP BY.
+
+[source,sql]
+----
+-- Simple join
+SELECT d.id, d.title, e.action
+FROM   docs d JOIN events e ON d.id = e.doc_id
+WHERE  e.action IN ('view','download')
+
+-- Aggregate on top
+SELECT d.lang, COUNT(*) AS interactions
+FROM   docs d JOIN events e ON d.id = e.doc_id
+GROUP BY d.lang
+----
+
+=== Long-running ad-hoc report with a cancel button
+
+Batch query that might take minutes. Client sends `retries: 1` for
+transient recovery, keeps the returned `queryId`, and can DELETE if
+the user cancels from the UI.
+
+[source,bash]
+----
+qid=$(curl -sS -X POST http://mesh/mesh/queries \
+      -H 'Content-Type: application/json' \
+      -d '{"sql":"...heavy query...","timeoutMs":600000,"retries":1}' \
+      --max-time 3 | jq -r .queryId)
+
+# User clicks "cancel":
+curl -X DELETE "http://mesh/mesh/queries/$qid"
+----
+
+<<<
+
+= Part IV — Reference
+
+== Configuration
+
+=== Driver — `application.yml` shape
+
+[source,yaml]
+----
+server:
+  port: 8085
+
+hitorro:
+  mesh:
+    driver:
+      transport: nats                    # nats | inmemory
+      nats-url: nats://localhost:4222
+      nats-security:                     # phase 7a; empty = plaintext
+        tls: false
+        # credentialsFile: /path/to/mesh.creds
+        # username: alice
+        # password: secret
+        # token: xxx
+        # trustStorePath / trustStorePassword
+        # keyStorePath / keyStorePassword
+      agent-expiry: 15s                  # heartbeat gap before agent is dead
+      shuffle-width: 4                   # combine workers per shuffle query
+      broadcast-tables: [langs]
+      tables:
+        - name: docs
+          type-json-resource: classpath:types/docs.json
+          partitions:
+            - key: us
+              required-capabilities: [jvssql, "partition:docs:us"]
+            - key: eu
+              required-capabilities: [jvssql, "partition:docs:eu"]
+
+management:
+  endpoints:
+    web:
+      exposure: { include: health,info,metrics,prometheus }
+----
+
+=== Agent — `application.yml` shape
+
+[source,yaml]
+----
+server:
+  port: 8091
+
+hitorro:
+  mesh:
+    agent:
+      id: agent-us
+      transport: nats
+      nats-url: nats://localhost:4222
+      nats-security: {}                  # same shape as driver's
+      heartbeat-interval: 500ms
+      capabilities:
+        - jvssql
+        - partition:docs:us
+      tables:
+        - name: docs                     # NDJSON-backed (batch)
+          partition-key: us
+          type-json-resource: file:/config/types/docs.json
+          ndjson-file: file:/data/us.ndjson
+        - name: events                   # Kafka-backed (streaming, phase 6b.1)
+          partition-key: us
+          type-json-resource: file:/config/types/events.json
+          kafka:
+            bootstrap-servers: kafka:9092
+            group-id: mesh-agent-us
+            topic: events
+            auto-offset-reset: latest
+        - name: metrics                  # NATS-JetStream-backed
+          partition-key: us
+          type-json-resource: file:/config/types/metrics.json
+          nats:
+            url: nats://nats.mesh:4222
+            stream: METRICS
+            subject: metrics.us.>
+            durable-name: mesh-agent-us
+      broadcast-tables:
+        - name: langs
+          type-json-resource: file:/config/types/langs.json
+          ndjson-file: file:/data/langs.ndjson
+----
+
+=== System properties
+
+[cols="2,1,3", options="header"]
+|===
+| Property | Default | Purpose
+
+| `hitorro.mesh.driver.max-queue-rows`
+| 100000
+| Bounded result-queue cap per query. Overflow drops rows +
+  logs WARN + increments `mesh.backpressure.drops.total`.
+
+| `hitorro.mesh.driver.max-task-retries`
+| 1
+| Per-partition surgical retries on ERROR (only if 0 rows emitted).
+
+| `hitorro.mesh.watermark.idle-timeout-ms`
+| 30000
+| Streaming — advance watermark on wall-clock after idle.
+
+|===
+
+<<<
+
+== REST API summary
+
+[cols="1,1,3", options="header"]
+|===
+| Method | Path | Purpose
+
+| POST | `/mesh/queries` | Submit + collect. Body `{sql, timeoutMs, retries}`; returns `{queryId, assignedAgents, rowCount, rows, timedOut, attempts}`.
+| GET | `/mesh/queries/stream` | SSE. Params `sql`, `timeoutMs`. Events: `opened`, `row`, `complete`, `error`.
+| DELETE | `/mesh/queries/{queryId}` | Cancel in-flight query.
+| GET | `/mesh/queries` | List active queries.
+| GET | `/mesh/queries/explain?sql=...` | Return the mesh's plan without executing.
+| GET | `/mesh/agents` | Live jvssql-capable agents.
+| GET | `/mesh/tables` | Registered distributed + broadcast tables.
+| GET | `/mesh/cluster` | Merged health per agent (HEALTHY / MISSING / ORPHAN).
+| GET | `/actuator/health` | Includes `mesh` indicator with per-partition coverage.
+| GET | `/actuator/prometheus` | All `mesh_*` meters.
+|===
+
+<<<
+
+== Metrics
+
+All prefixed `mesh_`.
+
+[cols="2,1,3", options="header"]
+|===
+| Meter | Type | Meaning
+
+| `mesh_queries_total{outcome}` | counter | queries succeeded / errored
+| `mesh_query_duration_seconds{outcome}` | histogram | wall-clock submit → last row
+| `mesh_rows_returned_total` | counter | total rows delivered to clients
+| `mesh_agents_live` | gauge | jvssql-capable agents currently heartbeating
+| `mesh_tables_registered` | gauge | distributed tables in the registry
+| `mesh_broadcast_tables_registered` | gauge | broadcast tables in the registry
+| `mesh_backpressure_drops_total` | gauge | rows dropped by backpressure across all queries
+|===
+
+Standard JVM meters (`jvm_*`, `process_*`, `http_server_requests_seconds`)
+come for free via Spring Boot Actuator + Micrometer.
+
+<<<
+
+== Troubleshooting
+
+**"no live agent advertises 'jvssql'"** — the driver's capability lookup
+returned zero agents. Check `curl /mesh/agents` returns rows; if not,
+agents aren't heartbeating (see agent logs — TLS, network, config issue).
+
+**"only registered broadcast tables can be joined"** — a JOIN referenced
+a table the mesh doesn't know as distributed OR broadcast. Register it
+distributed via `driver.tables` or broadcast via `driver.broadcast-tables`.
+
+**"shuffle-hash JOIN currently supports INNER and LEFT only"** — you're
+running RIGHT / FULL. jvssql now supports all four (phase 4c.1); make
+sure your `hitorro-jvssql` dep is `>= 3.0.1`.
+
+**Windowed streaming query stalls forever** — check the phase-6d.2.2
+idle timeout. Default 30s; for backfill scenarios set very large.
+
+**Query timeout on the REST response** — increase `timeoutMs` (default
+5000). Check `mesh_query_duration_seconds` for the actual p99 to size it.
+
+**Agent in MISSING state on `/mesh/cluster`** — the platform bridge
+(Orion / K8s) declared an agent that hasn't heartbeated within
+`agent-expiry` (default 15s). Check pod logs, NATS connectivity, TLS.
+
+**`mesh_backpressure_drops_total` climbing** — a slow client (or slow
+network to the client) is falling behind fast-producing agents. Either
+speed up the consumer, raise `-Dhitorro.mesh.driver.max-queue-rows`,
+or use SSE (streaming) so results push as they arrive.
+
+**Partitioned answers off by a factor of N** — you registered the same
+NDJSON file on multiple agents that all claim different partition keys.
+Each agent scans the whole file → duplicate results. Ensure each
+partition file only sits on the agent for that partition.
+
+<<<
+
+== Where to go next
+
+* Full feature history: `hitorro-mesh-core/ROADMAP.md`
+* Architecture deep-dive: `hitorro-mesh-core/ARCHITECTURE.md`
+* Getting-started quick reference: `hitorro-mesh-core/GETTING_STARTED.md`
+* Reproducer scripts: `hitorro-mesh-examples/scripts/README.md`
+* Helm chart: `hitorro-mesh-k8s/helm/hitorro-mesh/values.yaml`
+* Wire DTOs: `hitorro-mesh-core/src/main/java/com/hitorro/mesh`
