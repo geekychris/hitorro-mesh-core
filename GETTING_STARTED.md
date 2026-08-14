@@ -197,6 +197,11 @@ supported for distribution:
 | Windowed aggregate (batch) | `SELECT WIN_START(event_time, 60000) ws, COUNT(*) n FROM events GROUP BY WIN_START(event_time, 60000)` |
 | Windowed aggregate (streaming) | Same query, streaming source registered — emits per-window rows incrementally |
 
+**Web UI** (phase 7o) — after `mesh-up.sh`, open <http://localhost:8085/>
+in a browser for a self-contained admin/debug/playground app: cluster
+status, SQL playground, streaming console with cancel, EXPLAIN plan
+viewer, active-queries manager, metrics snapshot.
+
 **Explicit cancel** (phase 7d):
 ```bash
 curl -X DELETE http://localhost:8085/mesh/queries/{queryId}
