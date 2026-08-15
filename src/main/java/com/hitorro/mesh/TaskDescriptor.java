@@ -42,16 +42,45 @@ public record TaskDescriptor(
         Set<String> requiredCapabilities,
         String resultSubject,         // final output (stage-0 non-shuffled, or stage-1 combined)
         ShuffleSpec shuffleSpec,      // stage-0 optional: hash output into bucket subjects
-        CombineSpec combineSpec       // stage-1 only: which bucket + expected upstream partitions
+        CombineSpec combineSpec,      // stage-1 only: which bucket + expected upstream partitions
+        String pipelineNodeSpec       // Phase-2 pipelines: single NodeSpec as YAML/JSON — see below
 ) {
-    /** Phase-1/2 convenience — plain stage-0 leaf, no shuffle. */
+    /**
+     * Phase-2 pipelines task shape. When {@code pipelineNodeSpec} is
+     * non-null the agent switches from SQL execution to running a
+     * hitorro-mesh-pipelines NodeSpec locally. Carried as YAML/JSON
+     * text so hitorro-mesh-core stays dependency-free of the pipelines
+     * module (mesh-core → pipelines would be the wrong direction).
+     * Agent side decodes with {@code JobSpecYaml.parse}, wraps in a
+     * synthetic single-node JobSpec, hands to a local JobRunner.
+     * Requires the {@code pipeline-node} capability.
+     */
+
+    /** Phase-1/2 convenience — plain stage-0 SQL leaf. */
     public TaskDescriptor(String queryId, String taskId, int stage, String sourceTable, String partitionKey,
                           String sqlPlan, Set<String> requiredCapabilities, String resultSubject) {
         this(queryId, taskId, stage, sourceTable, partitionKey, sqlPlan,
-                requiredCapabilities, resultSubject, null, null);
+                requiredCapabilities, resultSubject, null, null, null);
     }
 
-    /** Jackson: older messages without shuffleSpec/combineSpec still deserialize. */
+    /** Legacy 10-arg constructor kept for source-compat with earlier callers. */
+    public TaskDescriptor(String queryId, String taskId, int stage, String sourceTable, String partitionKey,
+                          String sqlPlan, Set<String> requiredCapabilities, String resultSubject,
+                          ShuffleSpec shuffleSpec, CombineSpec combineSpec) {
+        this(queryId, taskId, stage, sourceTable, partitionKey, sqlPlan,
+                requiredCapabilities, resultSubject, shuffleSpec, combineSpec, null);
+    }
+
+    /** Convenience factory for pipeline-node dispatch. */
+    public static TaskDescriptor pipelineNode(String queryId, String taskId,
+                                              Set<String> requiredCapabilities,
+                                              String resultSubject,
+                                              String pipelineNodeSpecYaml) {
+        return new TaskDescriptor(queryId, taskId, 0, null, null, null,
+                requiredCapabilities, resultSubject, null, null, pipelineNodeSpecYaml);
+    }
+
+    /** Jackson: older messages without shuffleSpec/combineSpec/pipelineNodeSpec still deserialize. */
     @JsonCreator
     public static TaskDescriptor create(
             @JsonProperty("queryId")              String queryId,
@@ -63,8 +92,9 @@ public record TaskDescriptor(
             @JsonProperty("requiredCapabilities") Set<String> requiredCapabilities,
             @JsonProperty("resultSubject")        String resultSubject,
             @JsonProperty("shuffleSpec")          ShuffleSpec shuffleSpec,
-            @JsonProperty("combineSpec")          CombineSpec combineSpec) {
+            @JsonProperty("combineSpec")          CombineSpec combineSpec,
+            @JsonProperty("pipelineNodeSpec")     String pipelineNodeSpec) {
         return new TaskDescriptor(queryId, taskId, stage, sourceTable, partitionKey, sqlPlan,
-                requiredCapabilities, resultSubject, shuffleSpec, combineSpec);
+                requiredCapabilities, resultSubject, shuffleSpec, combineSpec, pipelineNodeSpec);
     }
 }
