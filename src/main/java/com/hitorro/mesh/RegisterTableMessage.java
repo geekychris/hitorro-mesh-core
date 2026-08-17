@@ -54,12 +54,20 @@ public record RegisterTableMessage(
         String format,
         boolean broadcast,
         String partitionKey,
-        Map<String, String> sourceConfig) {
+        Map<String, String> sourceConfig,
+        String targetAgentId) {
 
-    /** 6-arg back-compat overload for callers that don't set sourceConfig. */
+    /** 6-arg back-compat overload — no sourceConfig, no target-agent filter. */
     public RegisterTableMessage(String name, String typeJson, String uri,
                                 String format, boolean broadcast, String partitionKey) {
-        this(name, typeJson, uri, format, broadcast, partitionKey, null);
+        this(name, typeJson, uri, format, broadcast, partitionKey, null, null);
+    }
+
+    /** 7-arg back-compat — no target-agent filter (any agent installs). */
+    public RegisterTableMessage(String name, String typeJson, String uri,
+                                String format, boolean broadcast, String partitionKey,
+                                Map<String, String> sourceConfig) {
+        this(name, typeJson, uri, format, broadcast, partitionKey, sourceConfig, null);
     }
 
     public RegisterTableMessage {
