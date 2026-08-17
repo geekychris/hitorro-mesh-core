@@ -2448,10 +2448,27 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
 | POST
 | `/mesh/queries/registered/{name}/schema`
 | Update an already-registered table's JVS type. Body:
-  `{typeJson: "…"}`. Parses to validate, re-registers on the driver
-  under the new type, re-fan-outs so agents reload. Data URI + format
-  unchanged. UI: "Refine schema" details in the runtime-table detail
-  modal.
+  `{typeJson: "…"}`. Parses to validate, verifies source file is still
+  readable, re-registers on the driver under the new type, re-fan-outs
+  so agents reload. Data URI + format unchanged. UI: "Refine schema"
+  details in the runtime-table detail modal.
+
+| POST
+| `/mesh/queries/register-existing`
+| Register an existing file (no SQL / sink). Body:
+  `{name, uri, format?, typeJson?}`. Type is induced from the first
+  ~10 lines if `typeJson` is omitted (NDJson only; Parquet requires
+  explicit typeJson). Verifies the URI is readable before fan-out.
+  Powers "make a pipeline-produced file queryable" workflows.
+
+| POST
+| `/mesh/queries/register-streaming`
+| Register a Kafka topic or NATS JetStream subject as a table. Body:
+  `{name, format: "kafka"\|"nats", typeJson, sourceConfig: {…}}`.
+  Required `sourceConfig` keys per format —
+  kafka: `bootstrap-servers`, `group-id`, `topic`;
+  nats: `url`, `stream`, `subject`. No URI, no induction — schema
+  is caller-declared for streams.
 
 | GET
 | `/mesh/queries/registered/{name}/agents`
@@ -2507,6 +2524,13 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
   `~/.hitorro/datasets` up to the MinIO bucket. Optional `?dataset=X`
   scopes to one dataset dir (skips `--remove` so unrelated bucket
   objects survive). Requires MinIO to be running.
+
+| GET
+| `/mesh/storage/minio/sync/stream`
+| SSE variant — streams the sync script's stdout live as `line`
+  events, followed by a `done` event with the exit code. UI's sync
+  buttons use this so long syncs show mc-mirror progress instead of
+  blocking the client until the script finishes.
 
 | POST
 | `/mesh/storage/minio/stop`
