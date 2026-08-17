@@ -1879,6 +1879,27 @@ runtime install from both partition slots (pk=null + pk="broadcast")
 and appends a tombstone to its journal so the entry doesn't
 resurrect on the next boot.
 
+**Listing what's runtime-registered.** `GET /mesh/queries/registered`
+returns the driver-side memory of tables registered via the write
+panel: `[{name, uri, format, typeJson, broadcast, partitionKey,
+agentsNotified, registeredAt}]`. Backed by an in-memory
+`RuntimeTableTracker` — driver-restart clears the list, but agents
+keep their durable journal so tables stay queryable across the
+bounce; the list just re-populates as new registrations arrive.
+
+The Playground tab renders this as a "Runtime-registered tables"
+fieldset (hidden when empty), one row per table with a ▶ button
+that pastes `SELECT * FROM <name> LIMIT 100` into the editor and a
+🗑 button that unregisters (with confirm).
+
+**Journal compaction.** On boot, after replay,
+`RuntimeTableJournal.compact()` rewrites the file to contain only
+the currently-active register records — tombstones and superseded
+entries are dropped. Atomic-rename via `.tmp` sibling so a crash
+mid-compaction leaves either the old journal or the new one, never
+a partial file. Only fires when there's more than a handful of lines
+to save (avoid churn on already-tight files).
+
 <<<
 
 [#s3-hot-switch]
@@ -2378,6 +2399,11 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
   UI can preview where a bare name will land.
 
 | GET
+| `/mesh/queries/registered`
+| Snapshot of runtime tables registered via the write panel this driver
+  session: `[{name, uri, format, agentsNotified, registeredAt, …}]`.
+
+| GET
 | `/mesh/storage`
 | Storage-layer summary: local + S3 backends, per-dataset presence
   matrix. See <<storage-layer>>.
@@ -2389,8 +2415,10 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
 
 | GET
 | `/mesh/storage/head`
-| Head-of-file preview. `?path=…&lines=N&bytes=N` — text for NDJson/CSV
-  (extension-based decompression), Avro schema + row count for Parquet.
+| Head-of-file preview. `?path=…&lines=N&bytes=N` — raw text (or
+  Avro schema for Parquet). The UI additionally parses CSV/TSV
+  responses into a small HTML table so preview is a readable grid,
+  not raw delimited text.
 
 | GET
 | `/mesh/storage/download`
