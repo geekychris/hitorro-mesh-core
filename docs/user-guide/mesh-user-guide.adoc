@@ -1717,6 +1717,172 @@ named `L` and `cnt`, not the internal `g0`/`c0` fallbacks.
 
 <<<
 
+[#storage-layer]
+== Storage — local files + S3/MinIO
+
+The mesh reads and writes through a single `BaseFile` abstraction so
+every path — dataset NDJSON, query-result export, browser walk — routes
+uniformly by URI scheme:
+
+[cols="1,3", options="header"]
+|===
+| Scheme | Backend
+| `file:/…` | local filesystem (default when no S3 is configured)
+| `s3://…`  | MinIO / S3-compatible endpoint via `MinioProtocolAdapter`
+| `hdfs://…` | Hadoop DFS via the HDFS adapter
+| `ftp://…`  | FTP via the FTP adapter
+|===
+
+Same `getBaseFileFromPath(url)` call at the read + write sites — no
+scheme-specific branches in caller code.
+
+=== Configuring S3/MinIO
+
+Set these env vars (or `hitorro.storage.s3.*` properties) before
+starting the driver. The `S3StorageAutoConfig` bean registers the
+adapter at boot when `HITORRO_STORAGE_S3_ENDPOINT` is present:
+
+[source,bash]
+----
+export HITORRO_STORAGE_S3_ENDPOINT=http://localhost:9000
+export HITORRO_STORAGE_S3_ACCESS_KEY=hitorro
+export HITORRO_STORAGE_S3_SECRET_KEY=hitorro-dev-only
+export HITORRO_STORAGE_S3_BUCKET=hitorro
+----
+
+Every `s3://bucket/key` URI passed through the driver then routes to
+that endpoint. Absence of the endpoint = local-only mode (no error).
+
+=== Starting MinIO for local development
+
+MinIO is the recommended dev-time S3-compatible server — a single
+Docker container backed by a named volume. Two ways to bring it up:
+
+**From the UI (one click, hot-switches the running driver):**
+
+Cluster tab → Storage card → *▶ Start MinIO*. The driver
+
+. runs `hitorro-mesh-examples/scripts/minio/minio-up.sh` (pulls the
+  image on first click, ~30 s; subsequent starts are seconds because
+  the container persists)
+. polls `http://localhost:9000/minio/health/live` until 200
+. constructs a `MinioProtocolAdapter` and calls
+  `BaseFileSystem.addProtocolAdapter(...)` — every subsequent `s3://`
+  lookup now resolves through MinIO, *no driver restart*
+. registers the adapter as a Spring singleton so
+  `ObjectProvider<MinioProtocolAdapter>` injections (StorageService,
+  QueryWriteController) pick it up immediately
+
+The button status flips to `running` and the detail line shows
+endpoint, bucket, console URL, credentials.
+
+**From the shell (persistent across driver restarts):**
+
+[source,bash]
+----
+cd hitorro-mesh-examples/scripts/minio
+./minio-up.sh           # brings container up + creates bucket
+./minio-sync-datasets.sh  # copies ~/.hitorro/datasets → s3://hitorro/datasets/
+./minio-down.sh         # docker compose down (data persists in volume)
+----
+
+Defaults (all overridable via `HITORRO_MINIO_*` env vars):
+
+[cols="1,2", options="header"]
+|===
+| Setting | Default
+| S3 API endpoint  | `http://localhost:9000`
+| Web console      | `http://localhost:9001` (login `hitorro` / `hitorro-dev-only`)
+| Root user        | `hitorro`
+| Root password    | `hitorro-dev-only`
+| Bucket           | `hitorro`
+|===
+
+=== Storage summary + browser (Cluster tab)
+
+The Storage card in the UI aggregates both backends and lets you walk
+the tree without leaving the driver:
+
+* **Local** — `~/.hitorro/datasets` file count + byte size
+* **MinIO / S3** — endpoint, bucket, reachability
+* **Dataset presence matrix** — per-dataset `local` vs `MinIO`
+  checkmarks (only shown when both are configured), so you can spot
+  what hasn't been synced yet
+* **Browse** — click into any prefix; breadcrumb navigation preserves
+  the scheme (`s3://`, `file:/`); the `↑ up` link uses the server's
+  computed parent so it always resolves
+
+Backed by `GET /mesh/storage` (summary) and
+`GET /mesh/storage/browse?path=…` (walk). The browse endpoint
+uses `BaseFileSystem.getBaseFileFromPath(...)` so local dirs and S3
+prefixes render identically.
+
+<<<
+
+[#query-export]
+== SELECT → file / S3 (query export)
+
+The Playground has a *Write results to storage* panel that runs your
+SQL and streams the rows to an NDJSON or Parquet file. Bare names
+resolve to a sensible default; explicit URIs pass through:
+
+[cols="2,3", options="header"]
+|===
+| Path field           | Where it writes to
+| `my-langs`           | `s3://<bucket>/queries/my-langs.<format>` (S3 configured), else `file:/<cwd>/queries/my-langs.<format>`
+| `file:/tmp/out.ndjson` | `/tmp/out.ndjson` (passthrough)
+| `s3://mybucket/x.parquet` | that exact key (passthrough)
+| `hdfs://nn:9000/…`   | HDFS via the HDFS adapter
+|===
+
+The Format dropdown picks the sink:
+
+* **ndjson** — one JSON per line via `NdjsonFileSink` (local `file:`) or
+  `BaseFileNdjsonSink` (`s3://`, `hdfs://` — routes through
+  `BaseFile.getOutputStream()`). `.gz` extension → gzip.
+* **parquet** — via `ParquetFileSink` from the `hitorro-streams-parquet`
+  module. Schema induced from the first row (nullable typed columns for
+  scalars, string fallback for nested). Requires `hitorro-streams-parquet`
+  on the classpath — the driver-app bundles it. For `s3://` targets the
+  controller rewrites the URI to `s3a://` and injects a Hadoop
+  `Configuration` carrying the driver's MinIO endpoint + credentials +
+  path-style-access, so the write hits the same bucket as the rest of
+  the mesh.
+
+A live-preview line under the input calls
+`GET /mesh/queries/write/resolve?path=…&format=…` on every keystroke so
+you always know where the bare name will land before clicking Write.
+The write response includes the resolved URI in the success message.
+
+**REST directly** — POST body shape:
+
+[source,json]
+----
+{
+  "sql":       "SELECT alpha3, reference_name FROM iso_639_3 LIMIT 5",
+  "format":    "ndjson",
+  "path":      "my-langs",
+  "timeoutMs": 60000
+}
+----
+
+Response:
+
+[source,json]
+----
+{
+  "queryId":     "958c0130",
+  "format":      "parquet",
+  "path":        "my-langs",
+  "resolved":    "s3://hitorro/queries/my-langs.parquet",
+  "rowsWritten": 5,
+  "elapsedMs":   697,
+  "success":     true
+}
+----
+
+<<<
+
 [#common-use-cases]
 == Common use cases
 
@@ -2002,6 +2168,48 @@ scheme `tls://`.
   large = disable for backfill scenarios.
 |===
 
+=== Storage — S3 / MinIO properties
+
+Set as `hitorro.storage.s3.*` in `application.yml` or as
+`HITORRO_STORAGE_S3_*` env vars (Spring Boot relaxed binding). Only
+`endpoint` is required — presence flips the `S3StorageAutoConfig`
+`ConditionalOnProperty` gate and registers `MinioProtocolAdapter`.
+
+[cols="2,1,3", options="header"]
+|===
+| Property | Default | Purpose
+
+| `hitorro.storage.s3.endpoint`
+| _(unset)_
+| S3 API URL, e.g. `http://localhost:9000` for local MinIO or
+  `https://s3.amazonaws.com` for AWS. Unset = local-only mode.
+
+| `hitorro.storage.s3.bucket`
+| `hitorro`
+| Default bucket used when a `s3://` URI omits the bucket, and target
+  for Playground writes with bare names.
+
+| `hitorro.storage.s3.access-key`
+| `hitorro`
+| Access key. For MinIO this is the root user
+  (`HITORRO_MINIO_ROOT_USER`); for AWS the IAM key.
+
+| `hitorro.storage.s3.secret-key`
+| `hitorro-dev-only`
+| Secret. For MinIO this is the root password
+  (`HITORRO_MINIO_ROOT_PASSWORD`).
+
+| `hitorro.storage.s3.ssl`
+| `false`
+| TLS to the endpoint. Off for local MinIO on HTTP.
+
+| `hitorro.storage.minio.scripts-dir`
+| _(auto-discovered)_
+| Override for the MinIO lifecycle service's `minio-up.sh` /
+  `minio-down.sh` location. Auto-lookup walks up from CWD looking for
+  `hitorro-mesh-examples/scripts/minio`.
+|===
+
 <<<
 
 [#rest-api-summary]
@@ -2044,6 +2252,43 @@ scheme `tls://`.
 | GET
 | `/mesh/cluster`
 | Merged health per agent (HEALTHY / MISSING / ORPHAN).
+
+| POST
+| `/mesh/queries/write`
+| Run SQL + write rows to a URI (`file:/`, `s3://`, `hdfs://`, or bare
+  name). Body `{sql, format: "ndjson"\|"parquet", path, timeoutMs}`;
+  returns `{queryId, rowsWritten, resolved, elapsedMs, success}`.
+  See <<query-export>>.
+
+| GET
+| `/mesh/queries/write/resolve`
+| Pre-flight resolver — no SQL executed. Returns `{resolved}` so the
+  UI can preview where a bare name will land.
+
+| GET
+| `/mesh/storage`
+| Storage-layer summary: local + S3 backends, per-dataset presence
+  matrix. See <<storage-layer>>.
+
+| GET
+| `/mesh/storage/browse`
+| Walk any URI via `BaseFile`. `?path=…` (bare = default root); returns
+  `{resolved, parent, entries[{name, isDir, size}]}`.
+
+| GET
+| `/mesh/storage/minio`
+| MinIO lifecycle status — reachability, adapter registration, docker
+  availability, credentials hints.
+
+| POST
+| `/mesh/storage/minio/start`
+| Run `minio-up.sh`, poll health, register the adapter at runtime
+  (no driver restart).
+
+| POST
+| `/mesh/storage/minio/stop`
+| `docker compose down`. Adapter stays registered so a subsequent
+  start doesn't need re-wiring.
 
 | GET
 | `/actuator/health`
@@ -2281,6 +2526,30 @@ preserves `AS foo` aliases through combine SQL.
 — the JVM truststore doesn't contain the CA that signed the NATS
 server cert. Add a PKCS12 truststore via `nats-security.trustStorePath`
 (see <<tls-handshake>>).
+
+*MinIO "Connection refused" on `http://localhost:9000`* — the
+container isn't running. Click *▶ Start MinIO* on the Cluster tab, or
+run `hitorro-mesh-examples/scripts/minio/minio-up.sh`. First start
+takes ~30 s to pull the image; subsequent starts are seconds.
+
+*Storage browser shows "Error" at the root* — the default browse root
+was hard-coded to `s3://<bucket>/datasets/`; a fresh bucket has no
+such prefix so S3 returned "not found". Fixed in driver-app 6ef4cae —
+the default is now the bucket root and shows every top-level prefix
+that actually exists.
+
+*Playground write to `s3://` reports success but no object in bucket*
+— the stock `NdjsonFileSink` is local-only; `Path.of("s3://…")` was
+being treated as a POSIX path and files landed at `./s3:/bucket/…`.
+Fixed in driver-app b2f386b — non-`file:` URIs route through
+`BaseFileNdjsonSink` (via `BaseFile.getOutputStream()`). For Parquet:
+`s3://` gets rewritten to `s3a://` with the driver's MinIO
+credentials injected into a Hadoop `Configuration`.
+
+*`Relative path in absolute URI: file:./queries/foo`* — `file:`
+URIs require an absolute path per RFC 3986. Fixed in QueryWriteController
+by absolute-ifying against `user.dir` before handing to the sinks.
+Upgrade to driver-app 894f073 or later.
 
 <<<
 
