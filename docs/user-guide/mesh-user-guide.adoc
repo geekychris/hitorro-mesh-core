@@ -2500,6 +2500,22 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
   is caller-declared for streams.
 
 | POST
+| `/mesh/queries/register-partitioned`
+| Register a partitioned table where distinct shards live on distinct
+  agents. Body:
+  `{name, typeJson, format, partitions: [{key, uri, agentId?}]}`.
+  For each partition without an explicit `agentId`, the configured
+  `PartitionPlacement` (default: hash) picks a live jvssql agent;
+  driver publishes a targeted `RegisterTableMessage` so only that
+  agent installs. Each installing agent advertises a
+  `partition:<name>:<key>` capability on its next heartbeat so the
+  driver's dispatcher routes partition-scoped queries correctly.
+
+  Configure the strategy with `hitorro.mesh.runtime.placement:
+  hash \| round-robin \| custom` (custom → supply a
+  `PartitionPlacement` Spring bean).
+
+| POST
 | `/mesh/queries/write/batch`
 | Run N SELECTs sequentially, each writing to its own file. Body:
   `{queries: [{sql, tableName?, path?, typeJsonOverride?}], format,
