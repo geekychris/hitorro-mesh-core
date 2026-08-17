@@ -111,6 +111,30 @@ public final class Subjects {
     }
 
     /**
+     * {@code mesh.agent.control.inventory-request} — driver publishes a
+     * {@link TableInventoryRequest} here; every live agent responds on
+     * {@link #agentInventoryReply(String, String)}.
+     */
+    public static String agentControlInventoryRequest() {
+        return AGENT_CONTROL_PREFIX + "inventory-request";
+    }
+
+    /**
+     * {@code mesh.agent.control.inventory-reply.<replyId>.<agentId>} —
+     * agent responds on this subject to a {@link TableInventoryRequest}.
+     * Driver subscribes to the wildcard variant for the request's
+     * lifetime so it fans-in every agent's reply.
+     */
+    public static String agentInventoryReply(String replyId, String agentId) {
+        return AGENT_CONTROL_PREFIX + "inventory-reply." + replyId + "." + agentId;
+    }
+
+    /** Wildcard driver subscribes to for a single inventory request. */
+    public static String allAgentInventoryReplies(String replyId) {
+        return AGENT_CONTROL_PREFIX + "inventory-reply." + replyId + ".>";
+    }
+
+    /**
      * {@code mesh.agent.control.enable-s3} — driver publishes here after
      * hot-wiring its own MinIO adapter, so every live agent installs the
      * same S3 protocol adapter and can immediately read {@code s3://}
