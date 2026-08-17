@@ -1308,6 +1308,57 @@ pdb --> ddep
 * Downward API — pod annotations feed the agent's capability list
 * `nats-security` block generation from Helm values
 
+=== fleet-retrieval + federated coordination
+
+For document-shape retrieval, opt in to N `hitorro-fleet-retrieval`
+replicas alongside the mesh agents. The Helm chart ships a StatefulSet
++ two Services when `fleetRetrieval.enabled: true`:
+
+....
+Namespace: mesh
+├── driver Deployment ─────────────▶ Service: mesh-driver:8085
+├── agent-{us,eu,apac} Deployments ─▶ NATS  (SQL fan-out via mesh-core)
+└── fleet-retrieval StatefulSet
+    ├── fleet-retrieval-0 (PVC data-0)  ─┐
+    ├── fleet-retrieval-1 (PVC data-1)   │─▶ Service: fleet-retrieval:8087
+    ├── fleet-retrieval-2 (PVC data-2)  ─┘       (label app=hitorro-fleet-retrieval)
+    └── Service: fleet-retrieval-headless        (stable per-pod DNS)
+....
+
+The driver's `KubernetesFleetEndpointRegistry` (in `hitorro-mesh-k8s`)
+watches the `app=hitorro-fleet-retrieval` label and hands the endpoint
+list to `FederatedRetrievalService`. Client queries via
+`POST /mesh/retrieval/federated` fan out to every replica in parallel
+and merge via a caller-selected merger (`score` | `rrf` | `field:name`).
+
+`values.yaml` knobs:
+
+[source,yaml]
+----
+fleetRetrieval:
+  enabled: true
+  replicas: 3
+  mode: shared           # ReadOnlyIndex/Kv secondaries (no lock contention with pipeline writers)
+  image:
+    repository: hitorro/fleet-retrieval
+    tag: 3.0.1
+  storage:
+    size: 50Gi
+    accessMode: ReadWriteOnce
+    # storageClassName: fast-ssd
+  resources:
+    requests: { cpu: 500m, memory: 1Gi }
+    limits:   { cpu: 2,    memory: 4Gi }
+----
+
+For **Orion** deployments, the equivalent template lives at
+`hitorro-mesh-orion/templates/fleet-retrieval.yaml`. Same
+capability-based discovery — `OrionFleetEndpointRegistry` (in
+`hitorro-mesh-orion`) polls Orion for services declaring the
+`fleet-retrieval` capability and feeds them into the same
+`FederatedRetrievalService`. No code differs between K8s and Orion —
+only the discovery adapter.
+
 <<<
 
 = Part II — Getting started (tutorial)
