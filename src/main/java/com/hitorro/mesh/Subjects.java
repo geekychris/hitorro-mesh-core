@@ -28,6 +28,7 @@ public final class Subjects {
     public static final String RESULT_PREFIX    = "mesh.query.result.";
     public static final String CONTROL_PREFIX   = "mesh.query.control.";
     public static final String SHUFFLE_PREFIX   = "mesh.query.shuffle.";
+    public static final String AGENT_CONTROL_PREFIX = "mesh.agent.control.";
 
     /** {@code mesh.agent.heartbeat.<agentId>} — one subject per agent. */
     public static String heartbeat(String agentId) {
@@ -76,5 +77,22 @@ public final class Subjects {
      */
     public static String shuffle(String queryId, int bucket) {
         return SHUFFLE_PREFIX + queryId + "." + bucket;
+    }
+
+    /**
+     * {@code mesh.agent.control.broadcast} — driver publishes here to send
+     * a control message (currently {@link RegisterTableMessage}) to EVERY
+     * live agent. Agents subscribe to the wildcard
+     * {@code mesh.agent.control.>} so future per-agent control subjects
+     * (e.g. {@code mesh.agent.control.<agentId>}) work without another
+     * subscription change.
+     */
+    public static String agentControlBroadcast() {
+        return AGENT_CONTROL_PREFIX + "broadcast";
+    }
+
+    /** Wildcard every agent subscribes to for driver → agent control. */
+    public static String allAgentControl() {
+        return AGENT_CONTROL_PREFIX + ">";
     }
 }
