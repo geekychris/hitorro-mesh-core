@@ -2599,6 +2599,12 @@ driver and agent.
 | gauge
 | Rows dropped by backpressure across all queries. Non-zero → slow
   consumer or under-sized queue cap.
+
+| `mesh_runtime_tables_total`
+| gauge
+| Runtime tables the driver knows about (via RuntimeTableTracker).
+  Alert on unexpected growth — e.g. an integration accidentally
+  re-registering per request instead of once.
 |===
 
 === Agent-side (phase 7m)
@@ -2615,6 +2621,7 @@ per-agent load.
 | `mesh_agent_rows_emitted_total{agent}` | gauge | cumulative result rows published
 | `mesh_agent_tasks_errored_total{agent}` | gauge | tasks that finished by publishing ERROR
 | `mesh_agent_watermarks_emitted_total{agent}` | gauge | streaming heartbeat count
+| `mesh_agent_runtime_tables_total{agent}` | gauge | runtime tables installed via RegisterTableMessage (counted as registry slots; broadcast dual-install reads as 2)
 |===
 
 === JVM + HTTP (free from Spring Boot Actuator)
