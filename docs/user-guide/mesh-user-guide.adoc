@@ -1819,6 +1819,75 @@ prefixes render identically.
 
 <<<
 
+[#runtime-tables]
+== Runtime table registration
+
+The Playground's write panel has a *Register as broadcast table*
+checkbox. Tick it (optionally supply a table name), click Write, then
+run `SELECT * FROM <name>` immediately — no restart, no config edit.
+
+The flow spans three moving parts:
+
+. **Driver-side dual registration.** The driver adds the name to its
+  broadcast set (so planner-side JOIN validation accepts it) AND
+  registers a single-partition distributed table with only the
+  `jvssql` capability (so `SELECT * FROM x` routes to any live
+  jvssql agent). Mirrors what `MeshRegistrar.registerBroadcastAsDistributed`
+  does for shipped datasets.
+
+. **Fan-out via NATS.** The driver publishes a
+  `RegisterTableMessage(name, typeJson, uri, format, broadcast, partitionKey)`
+  on `mesh.agent.control.register-table`. Every live agent subscribes
+  to that subject and installs the referenced file in its
+  `RuntimeTableRegistry`.
+
+. **Agent-side install.** `RuntimeTableInstaller` builds an
+  `NdjsonLocalTable` or `ParquetLocalTable` from the URI + format,
+  registers it in the agent's runtime registry under BOTH `pk=null`
+  (for JOIN broadcast enumeration) and `pk="broadcast"` (for direct
+  `SELECT * FROM x` scan). The `TaskExecutor.requireLocalTable` +
+  `engineWithBroadcasts` lookups check the runtime registry FIRST,
+  so a runtime entry with a given name shadows any boot-time entry.
+
+**Type induction.** The driver induces the JVS type from the first
+result row — every column becomes a nullable `core_string` /
+`core_long` / `core_double` / `core_boolean` based on the JsonNode
+kind. Nested objects fall back to `core_string`. Good enough for
+ad-hoc query-result tables; for strict typing, build the type
+yourself and hit `POST /mesh/tables` directly.
+
+**S3-backed writes need agents to have the S3 adapter.** If the
+driver has S3 configured but agents don't, the runtime registration
+still succeeds at the driver, but the agent-side install fails when
+the URI is `s3://…`. The `Start MinIO` button fixes this in the same
+click — see next section.
+
+<<<
+
+[#s3-hot-switch]
+== S3 hot-switch — one click enables the whole mesh
+
+The driver's `Start MinIO` button doesn't just wire the driver's own
+S3 adapter — it also publishes an `EnableS3Message(endpoint, bucket,
+accessKey, secretKey, ssl)` on `mesh.agent.control.enable-s3`. Every
+live agent subscribes to that subject via `S3AdapterInstaller` and
+installs the same `MinioProtocolAdapter`. Result: `s3://…` URIs
+resolve on every agent's `BaseFileSystem.getBaseFileFromPath()` from
+that moment on.
+
+Without this, agents that boot without `HITORRO_STORAGE_S3_ENDPOINT`
+can't read `s3://` runtime-registered tables — they'd only see the
+enable-s3 message if they were listening. With it, the whole loop
+works: click Start MinIO → write `SELECT` to `s3://` → register as
+broadcast table → `SELECT * FROM <name>` returns rows from an agent
+reading the s3 file.
+
+Credentials cross the wire. Use TLS + NATS auth
+(<<NatsSecurityProperties — auth + TLS>>) when the mesh isn't
+localhost-only.
+
+<<<
+
 [#query-export]
 == SELECT → file / S3 (query export)
 
@@ -1862,9 +1931,35 @@ The write response includes the resolved URI in the success message.
   "sql":       "SELECT alpha3, reference_name FROM iso_639_3 LIMIT 5",
   "format":    "ndjson",
   "path":      "my-langs",
-  "timeoutMs": 60000
+  "timeoutMs": 60000,
+
+  "register":  true,          // OPTIONAL — install as broadcast table on every agent
+  "tableName": "my_langs"     // OPTIONAL — defaults to sanitised file stem
 }
 ----
+
+When `register: true`, the response gains a `registered` block:
+
+[source,json]
+----
+{
+  "queryId":     "958c0130",
+  "rowsWritten": 5,
+  "resolved":    "s3://hitorro/queries/my-langs.parquet",
+  "registered": {
+    "tableName":       "my_langs",
+    "typeJson":        "{\"name\":\"my_langs\",\"fields\":[…]}",
+    "uri":             "s3://hitorro/queries/my-langs.parquet",
+    "format":          "parquet",
+    "broadcast":       true,
+    "agentsNotified":  2
+  },
+  "elapsedMs": 697,
+  "success":   true
+}
+----
+
+See <<runtime-tables>> for how the fan-out to agents works.
 
 Response:
 
@@ -2276,14 +2371,26 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
   `{resolved, parent, entries[{name, isDir, size}]}`.
 
 | GET
+| `/mesh/storage/head`
+| Head-of-file preview. `?path=…&lines=N&bytes=N` — text for NDJson/CSV
+  (extension-based decompression), Avro schema + row count for Parquet.
+
+| GET
 | `/mesh/storage/minio`
 | MinIO lifecycle status — reachability, adapter registration, docker
   availability, credentials hints.
 
 | POST
 | `/mesh/storage/minio/start`
-| Run `minio-up.sh`, poll health, register the adapter at runtime
-  (no driver restart).
+| Run `minio-up.sh`, poll health, register the adapter at runtime,
+  and fan out an `EnableS3Message` so every live agent installs the
+  same adapter (see <<s3-hot-switch>>).
+
+| POST
+| `/mesh/storage/minio/sync`
+| Shell out to `minio-sync-datasets.sh` — copies
+  `~/.hitorro/datasets` up to the MinIO bucket. Requires MinIO to be
+  running; returns the script's stdout in the response.
 
 | POST
 | `/mesh/storage/minio/stop`
@@ -2550,6 +2657,25 @@ credentials injected into a Hadoop `Configuration`.
 URIs require an absolute path per RFC 3986. Fixed in QueryWriteController
 by absolute-ifying against `user.dir` before handing to the sinks.
 Upgrade to driver-app 894f073 or later.
+
+*Write + register succeeded but `SELECT * FROM <name>` says "does not
+hold partition broadcast of table X"* — one or more agents failed to
+install the table but didn't crash the write. Check agent logs for
+`failed to register runtime table` lines. Common cause: agent is on
+an older jar without `RuntimeTableInstaller` — rebuild + restart
+`hitorro-mesh-agent-app` (needs commit 9767d14 or later).
+
+*Register succeeded on agents but `SELECT` still fails with
+"ClassNotFoundException: S3AFileSystem"* — the agent doesn't have
+`hadoop-aws` on its classpath, so `s3://` URIs can't be read by
+`NdjsonLocalTable` / `ParquetLocalTable`. Fixed in agent-app d9c890b
+(the `hadoop-aws` dep was added). Rebuild + restart agents.
+
+*Parquet install fails with "NoClassDefFoundError: FileInputFormat"*
+— `ParquetReadOptions.Builder` references
+`org.apache.hadoop.mapreduce.lib.input.FileInputFormat` in its static
+init. Fixed by adding `hadoop-mapreduce-client-core` to the agent-app
+pom (~1 MB extra).
 
 <<<
 
