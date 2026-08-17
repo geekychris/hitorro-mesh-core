@@ -2516,6 +2516,17 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
   `PartitionPlacement` Spring bean).
 
 | POST
+| `/mesh/queries/registered/reconcile-partitions`
+| Reactive re-hash on agent drop. Walks the tracker for partitioned
+  entries and: (a) leaves partitions whose target agent is still
+  alive alone; (b) re-hashes partitions whose target dropped, via
+  the configured PartitionPlacement against the current live set,
+  publishing fresh RegisterTableMessages; (c) refuses to re-assign
+  partitions the operator pinned with an explicit `agentId` (sticky
+  routing was intentional). Returns
+  `{rehashed[], skippedExplicit[], stillLive[], refused[]}`.
+
+| POST
 | `/mesh/queries/write/batch`
 | Run N SELECTs sequentially, each writing to its own file. Body:
   `{queries: [{sql, tableName?, path?, typeJsonOverride?}], format,
