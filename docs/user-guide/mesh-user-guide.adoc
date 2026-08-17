@@ -1862,6 +1862,23 @@ still succeeds at the driver, but the agent-side install fails when
 the URI is `s3://…`. The `Start MinIO` button fixes this in the same
 click — see next section.
 
+**Persistence across agent restarts.** Every install writes an
+NDJSON record to
+`${hitorro.agent.home}/runtime-tables/<agentId>.jsonl`
+(default `~/.hitorro/agent/runtime-tables/<agentId>.jsonl`). On boot,
+`RuntimeTableInstaller.start()` dedups the journal by (name,
+partitionKey), drops entries with later tombstones, and reinstalls the
+surviving set BEFORE opening the live NATS subscription. Agents rejoin
+the mesh with the same runtime tables they had before the restart.
+
+**Unregister flow — symmetric.** `DELETE /mesh/tables/{name}` (or
+`DELETE /mesh/broadcast-tables/{name}`) removes the driver-side entry
+AND publishes an `UnregisterTableMessage` on
+`mesh.agent.control.unregister-table`. Every live agent drops the
+runtime install from both partition slots (pk=null + pk="broadcast")
+and appends a tombstone to its journal so the entry doesn't
+resurrect on the next boot.
+
 <<<
 
 [#s3-hot-switch]
@@ -2376,6 +2393,16 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
   (extension-based decompression), Avro schema + row count for Parquet.
 
 | GET
+| `/mesh/storage/download`
+| Stream a file with `Content-Disposition: attachment`. Any URI the
+  BaseFile layer knows (file:, s3://, hdfs://, ftp:). Directories 400.
+
+| DELETE
+| `/mesh/storage/object`
+| Delete an object at `?path=…` via `BaseFile.delete`. Returns
+  `{deleted, wasDir}`. Missing paths → 400.
+
+| GET
 | `/mesh/storage/minio`
 | MinIO lifecycle status — reachability, adapter registration, docker
   availability, credentials hints.
@@ -2389,8 +2416,9 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
 | POST
 | `/mesh/storage/minio/sync`
 | Shell out to `minio-sync-datasets.sh` — copies
-  `~/.hitorro/datasets` up to the MinIO bucket. Requires MinIO to be
-  running; returns the script's stdout in the response.
+  `~/.hitorro/datasets` up to the MinIO bucket. Optional `?dataset=X`
+  scopes to one dataset dir (skips `--remove` so unrelated bucket
+  objects survive). Requires MinIO to be running.
 
 | POST
 | `/mesh/storage/minio/stop`
