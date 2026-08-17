@@ -1869,6 +1869,29 @@ still succeeds at the driver, but the agent-side install fails when
 the URI is `s3://…`. The `Start MinIO` button fixes this in the same
 click — see next section.
 
+**Pipeline auto-register.** An {@code ndjson-file} sink in a pipeline
+spec can carry a {@code registerAsTable} block that automatically
+publishes the file as a runtime table when the sink closes:
+
+[source,yaml]
+----
+sinks:
+  - kind: ndjson-file
+    url: file:/tmp/out.ndjson
+    registerAsTable:
+      tableName: my_output
+      broadcast: true
+      # partitionKey: "all"   # when broadcast=false
+      # typeJson: "{…}"       # omit to induce from first N lines
+----
+
+Wired by a `SinkRegistry` decorator in the driver-app that intercepts
+NDJSON sinks whose spec has `registerAsTable` set and calls
+`/mesh/queries/register-existing`-equivalent internally on
+`Sink.close`. Failure to register is logged but doesn't fail the
+pipeline — the file's already written; only the SQL binding needs a
+manual retry.
+
 **Persistence across agent restarts.** Every install writes an
 NDJSON record to
 `${hitorro.agent.home}/runtime-tables/<agentId>.jsonl`
