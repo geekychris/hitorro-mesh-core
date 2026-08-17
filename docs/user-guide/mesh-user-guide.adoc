@@ -2470,6 +2470,14 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
   nats: `url`, `stream`, `subject`. No URI, no induction — schema
   is caller-declared for streams.
 
+| POST
+| `/mesh/queries/write/batch`
+| Run N SELECTs sequentially, each writing to its own file. Body:
+  `{queries: [{sql, tableName?, path?, typeJsonOverride?}], format,
+  timeoutMs, register}`. Per-query overrides beat batch defaults.
+  Failures on any single query don't abort subsequent queries — each
+  result captured independently. UI: "↓↓ Batch" button opens a modal.
+
 | GET
 | `/mesh/queries/registered/{name}/agents`
 | Live inventory probe. Fans out a `TableInventoryRequest` on
