@@ -1852,9 +1852,16 @@ The flow spans three moving parts:
 **Type induction.** The driver induces the JVS type from the first
 result row — every column becomes a nullable `core_string` /
 `core_long` / `core_double` / `core_boolean` based on the JsonNode
-kind. Nested objects fall back to `core_string`. Good enough for
-ad-hoc query-result tables; for strict typing, build the type
-yourself and hit `POST /mesh/tables` directly.
+kind. Nested objects fall back to `core_string`.
+
+Two ways to get stricter typing than induction gives you:
+
+* Set `typeJsonOverride` on the write request. Skips induction and
+  registers with your exact type. Handy when the first row has a
+  null in a column that's actually numeric.
+* After registering, open the detail modal → *Refine schema* →
+  edit the typeJson → **Update schema on all agents**. Re-fan-outs
+  so agents reload their runtime install under the new type.
 
 **S3-backed writes need agents to have the S3 adapter.** If the
 driver has S3 configured but agents don't, the runtime registration
@@ -2419,6 +2426,22 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
 | Bulk unregister of every runtime-registered table — driver-side
   removal + agent fan-out for each. UI equivalent: "🗑 clear all"
   link on the runtime-tables panel header.
+
+| POST
+| `/mesh/queries/registered/reconcile`
+| Fires an inventory probe, unregisters every runtime entry any agent
+  holds. Closes the "orphaned runtime tables from previous driver
+  sessions" gap — the tracker only knows what THIS driver registered,
+  but agent journals survive driver bounces. UI equivalent:
+  "🧹 reconcile" links on the runtime panel + inventory matrix.
+
+| POST
+| `/mesh/queries/registered/{name}/schema`
+| Update an already-registered table's JVS type. Body:
+  `{typeJson: "…"}`. Parses to validate, re-registers on the driver
+  under the new type, re-fan-outs so agents reload. Data URI + format
+  unchanged. UI: "Refine schema" details in the runtime-table detail
+  modal.
 
 | GET
 | `/mesh/queries/registered/{name}/agents`
