@@ -101,6 +101,16 @@ public final class Subjects {
     }
 
     /**
+     * {@code mesh.agent.control.unregister-table} — driver publishes here
+     * to remove a runtime-registered table from every live agent
+     * ({@link UnregisterTableMessage}). Symmetric to
+     * {@link #agentControlRegisterTable()}.
+     */
+    public static String agentControlUnregisterTable() {
+        return AGENT_CONTROL_PREFIX + "unregister-table";
+    }
+
+    /**
      * {@code mesh.agent.control.enable-s3} — driver publishes here after
      * hot-wiring its own MinIO adapter, so every live agent installs the
      * same S3 protocol adapter and can immediately read {@code s3://}
