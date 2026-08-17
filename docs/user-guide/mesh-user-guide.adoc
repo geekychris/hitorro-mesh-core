@@ -2414,6 +2414,22 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
 | Snapshot of runtime tables registered via the write panel this driver
   session: `[{name, uri, format, agentsNotified, registeredAt, …}]`.
 
+| POST
+| `/mesh/queries/registered/clear`
+| Bulk unregister of every runtime-registered table — driver-side
+  removal + agent fan-out for each. UI equivalent: "🗑 clear all"
+  link on the runtime-tables panel header.
+
+| GET
+| `/mesh/queries/registered/{name}/agents`
+| Live inventory probe. Fans out a `TableInventoryRequest` on
+  `mesh.agent.control.inventory-request`; agents reply with their
+  current runtime + boot inventories on the per-request wildcard.
+  Returns `{name, agentsAsked, agentsReplied, holders[]}` — answers
+  "who ACTUALLY holds this table right now" vs
+  `/mesh/queries/registered` which shows the fan-out targets at
+  registration time.
+
 | GET
 | `/mesh/storage`
 | Storage-layer summary: local + S3 backends, per-dataset presence
