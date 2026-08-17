@@ -1882,15 +1882,26 @@ resurrect on the next boot.
 **Listing what's runtime-registered.** `GET /mesh/queries/registered`
 returns the driver-side memory of tables registered via the write
 panel: `[{name, uri, format, typeJson, broadcast, partitionKey,
-agentsNotified, registeredAt}]`. Backed by an in-memory
-`RuntimeTableTracker` — driver-restart clears the list, but agents
-keep their durable journal so tables stay queryable across the
-bounce; the list just re-populates as new registrations arrive.
+agentsNotified, registeredAt}]`. Backed by `RuntimeTableTracker`,
+which persists the full snapshot atomically to
+`${hitorro.driver.home}/runtime-tables.json` (default
+`~/.hitorro/driver/runtime-tables.json`) on every mutation and reloads
+on boot. So the listing survives driver restarts; agents keep the
+actual data in their own journals independently. If you delete the
+driver-side file the list starts empty but the tables themselves stay
+queryable — the tracker just repopulates from new writes.
 
 The Playground tab renders this as a "Runtime-registered tables"
-fieldset (hidden when empty), one row per table with a ▶ button
-that pastes `SELECT * FROM <name> LIMIT 100` into the editor and a
-🗑 button that unregisters (with confirm).
+fieldset (hidden when empty). One row per table:
+
+* Table name is a link — opens a **detail modal** showing metadata
+  (uri / format / broadcast / registered-at / agents-notified),
+  the induced schema (parsed from typeJson), live sample rows
+  (`SELECT * FROM <name> LIMIT 20`), and the current jvssql-capable
+  agent set (eligible to serve).
+* **▶** pastes `SELECT * FROM <name> LIMIT 100` into the editor.
+* **🗑** unregisters (with confirm) — drops the driver-side entry AND
+  fans out `UnregisterTableMessage` to every agent.
 
 **Journal compaction.** On boot, after replay,
 `RuntimeTableJournal.compact()` rewrites the file to contain only
