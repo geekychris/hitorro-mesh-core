@@ -80,15 +80,34 @@ public final class Subjects {
     }
 
     /**
-     * {@code mesh.agent.control.broadcast} — driver publishes here to send
-     * a control message (currently {@link RegisterTableMessage}) to EVERY
-     * live agent. Agents subscribe to the wildcard
-     * {@code mesh.agent.control.>} so future per-agent control subjects
-     * (e.g. {@code mesh.agent.control.<agentId>}) work without another
-     * subscription change.
+     * {@code mesh.agent.control.broadcast} — legacy catch-all. Prefer the
+     * specific per-message subjects below. Kept only for callers that
+     * really do want to reach every agent with a message that doesn't
+     * have its own routing subject yet.
      */
     public static String agentControlBroadcast() {
         return AGENT_CONTROL_PREFIX + "broadcast";
+    }
+
+    /**
+     * {@code mesh.agent.control.register-table} — driver publishes here to
+     * install a table at runtime on every live agent
+     * ({@link RegisterTableMessage}). One subject per message class so
+     * agents can subscribe to exactly the messages they know how to handle
+     * — no per-callback try/decode fallbacks.
+     */
+    public static String agentControlRegisterTable() {
+        return AGENT_CONTROL_PREFIX + "register-table";
+    }
+
+    /**
+     * {@code mesh.agent.control.enable-s3} — driver publishes here after
+     * hot-wiring its own MinIO adapter, so every live agent installs the
+     * same S3 protocol adapter and can immediately read {@code s3://}
+     * URIs. See {@link EnableS3Message}.
+     */
+    public static String agentControlEnableS3() {
+        return AGENT_CONTROL_PREFIX + "enable-s3";
     }
 
     /** Wildcard every agent subscribes to for driver → agent control. */
