@@ -2456,10 +2456,16 @@ Set as `hitorro.storage.s3.*` in `application.yml` or as
 | POST
 | `/mesh/queries/register-existing`
 | Register an existing file (no SQL / sink). Body:
-  `{name, uri, format?, typeJson?}`. Type is induced from the first
-  ~10 lines if `typeJson` is omitted (NDJson only; Parquet requires
-  explicit typeJson). Verifies the URI is readable before fan-out.
-  Powers "make a pipeline-produced file queryable" workflows.
+  `{name, uri, format?, typeJson?, broadcast?, partitionKey?}`. Type
+  is induced from the first ~10 lines if `typeJson` is omitted
+  (NDJson only; Parquet requires explicit typeJson). Verifies the URI
+  is readable before fan-out.
+
+  * `broadcast: true` (default) → dual-install (pk=null + pk="broadcast")
+  * `broadcast: false` + `partitionKey` → single install under that
+    key; every agent claims the same key. Convention:
+    `partitionKey: "all"` mirrors the shipped-dataset autoregister
+    pattern.
 
 | POST
 | `/mesh/queries/register-streaming`
