@@ -2057,6 +2057,387 @@ Response:
 
 <<<
 
+[#runtime-tables-tutorials]
+== Tutorials — runtime tables in practice
+
+Copy-pastable walkthroughs for the runtime-tables + storage stack.
+Each starts from a running 1-driver + 2-agent mesh (Tier 2 or 3
+from the getting-started section).
+
+=== Tutorial 1: SELECT → file → register → query
+
+The core "make ad-hoc query results queryable" loop.
+
+[source,bash]
+----
+# 1. Run a SELECT and write results to NDJson, register the output.
+curl -s -X POST http://localhost:8085/mesh/queries/write \
+  -H 'content-type: application/json' \
+  -d '{
+    "sql":       "SELECT alpha3, reference_name FROM iso_639_3 LIMIT 5",
+    "format":    "ndjson",
+    "path":      "top-langs",
+    "register":  true,
+    "tableName": "top_langs"
+  }'
+# Response: {registered: {tableName: "top_langs", agentsNotified: 2, ...}}
+
+# 2. Query the just-registered table.
+curl -s http://localhost:8085/mesh/queries \
+  -H 'content-type: application/json' \
+  -d '{"sql":"SELECT * FROM top_langs"}'
+# Response: {rowCount: 5, rows: [{alpha3:"Id", ...}, ...]}
+----
+
+**What happened:** The driver ran the SELECT, wrote 5 rows to
+`./queries/top-langs.ndjson` (or `s3://bucket/queries/…` when S3 is
+configured), induced a JVS type from the first row, registered it
+driver-side, and published a `RegisterTableMessage` on
+`mesh.agent.control.register-table`. Both agents received the
+message, installed an in-memory `NdjsonLocalTable`, wrote the
+install record to `~/.hitorro/agent/runtime-tables/<id>.jsonl`, and
+started serving queries.
+
+**Persistence:** kill either agent + restart — it re-reads its
+journal and reinstalls `top_langs` before opening its NATS
+subscription. The table is queryable again the moment the agent
+finishes boot.
+
+=== Tutorial 2: Register an existing file (no SELECT)
+
+Sometimes the file was written by a pipeline or an external system.
+Skip the SQL:
+
+[source,bash]
+----
+curl -s -X POST http://localhost:8085/mesh/queries/register-existing \
+  -H 'content-type: application/json' \
+  -d '{
+    "name":   "prebuilt",
+    "uri":    "file:/tmp/data/prebuilt.ndjson",
+    "format": "ndjson"
+  }'
+----
+
+Type is induced from the first 10 lines. Pass `typeJson` explicitly
+if you need strict types (e.g., forcing `core_long` where induction
+saw a null in row 1).
+
+=== Tutorial 3: Partitioned register with per-agent placement
+
+Distinct shards on distinct agents. The driver runs the configured
+`PartitionPlacement` (default: hash) against the current live set.
+
+[source,bash]
+----
+curl -s -X POST http://localhost:8085/mesh/queries/register-partitioned \
+  -H 'content-type: application/json' \
+  -d '{
+    "name": "world_pop",
+    "typeJson": "{\"name\":\"world_pop\",\"fields\":[{\"name\":\"country\",\"type\":\"core_string\"},{\"name\":\"population\",\"type\":\"core_long\"}]}",
+    "format": "ndjson",
+    "partitions": [
+      {"key":"na", "uri":"file:/tmp/data/na.ndjson"},
+      {"key":"eu", "uri":"file:/tmp/data/eu.ndjson"}
+    ]
+  }'
+# Response: {assignments: {na: "agent-us", eu: "agent-eu"}, placementStrategy: "Hash"}
+----
+
+Within one heartbeat interval (~2s) both agents advertise the
+matching `partition:world_pop:*` capability and the dispatcher can
+route:
+
+[source,bash]
+----
+curl -s http://localhost:8085/mesh/queries \
+  -H 'content-type: application/json' \
+  -d '{"sql":"SELECT country, population FROM world_pop"}'
+# Response: assignedAgents: ["agent-us", "agent-eu"], rowCount: <sum>
+----
+
+**Sticky routing** — pass an explicit `"agentId": "agent-us"` per
+partition to override placement. The reconciler treats explicit
+targets as pinned and won't auto-reassign if that agent drops.
+
+=== Tutorial 4: Reactive re-hash when an agent drops
+
+Turn on the background reconciler once at driver startup:
+
+[source,bash]
+----
+java -jar hitorro-mesh-driver-app.jar \
+  -Dhitorro.mesh.runtime.reconcile.enabled=true \
+  -Dhitorro.mesh.runtime.reconcile.interval-ms=30000 \
+  -Dhitorro.mesh.runtime.reconcile.grace-ms=15000
+----
+
+The poller wakes every 30s, computes the live jvssql set, and for
+any partitioned entry whose target has been *continuously* absent for
+> 15s runs `PartitionPlacement` against the current live set and
+publishes a fresh `RegisterTableMessage`. Explicit-target partitions
+are skipped (operator intent respected).
+
+Manual trigger any time via the UI (Cluster tab → inventory matrix →
+🔄 button) or:
+
+[source,bash]
+----
+curl -s -X POST http://localhost:8085/mesh/queries/registered/reconcile-partitions
+# {rehashed: [...], stillLive: [...], skippedExplicit: [...], withinGrace: [...], refused: [...]}
+----
+
+=== Tutorial 5: MinIO from zero to synced datasets
+
+The one-click S3 dev loop. Assumes Docker Desktop on the machine.
+
+. Cluster tab → Storage card → **▶ Start MinIO** — pulls the image
+  on first run (~30s), starts the container, health-polls until
+  live, hot-wires a `MinioProtocolAdapter` on the driver AND
+  fan-outs `EnableS3Message` so every agent installs the same
+  adapter. Console at `http://localhost:9001` (login
+  `hitorro`/`hitorro-dev-only`).
+. **↻ Sync datasets** — shells out to `minio-sync-datasets.sh`,
+  streams `mc mirror` output line-by-line as SSE. Full sync when
+  bucket is empty; incremental on subsequent runs.
+. Any Playground write with a bare path (e.g. `my-langs`) now
+  resolves to `s3://hitorro/queries/my-langs.<format>` instead of
+  local disk. Register works the same way — agents read `s3://`
+  URIs via the adapter you just installed.
+
+=== Tutorial 6: Batch write for report generation
+
+Run N SELECTs sequentially, each writing to its own file, with
+optional per-query registration.
+
+[source,bash]
+----
+curl -s -X POST http://localhost:8085/mesh/queries/write/batch \
+  -H 'content-type: application/json' \
+  -d '{
+    "format":   "ndjson",
+    "register": true,
+    "queries": [
+      {"sql":"SELECT * FROM iso_639_3 WHERE alpha3 = '\''ita'\''",  "tableName":"italian"},
+      {"sql":"SELECT * FROM iso_639_3 WHERE alpha3 = '\''fra'\''",  "tableName":"french"},
+      {"sql":"SELECT * FROM iso_639_3 WHERE alpha3 = '\''deu'\''",  "tableName":"german"}
+    ]
+  }'
+# Response: {successes: 3, failures: 0, totalRowsWritten: 3, results: [...]}
+----
+
+Sequential — parallel queries would spike the dispatcher. Per-query
+failure doesn't abort the batch; each result is captured
+independently. UI equivalent: **↓↓ Batch** button on the Playground
+write panel.
+
+<<<
+
+[#runtime-tables-design]
+== Runtime tables — design rationale
+
+The choices behind the "why does it work this way" questions.
+
+=== Dual-install for broadcast tables
+
+An agent that receives a broadcast `RegisterTableMessage` installs
+the table under BOTH `partitionKey=null` AND
+`partitionKey="broadcast"`. Reason: two code paths in
+`TaskExecutor` look for tables by different keys.
+
+* `engineWithBroadcasts(...)` iterates
+  `RuntimeTableRegistry.broadcastSnapshot()` — entries where
+  `partitionKey == null`. Used when the query has a JOIN to a
+  broadcast dimension.
+* `requireLocalTable(TaskDescriptor)` looks up by
+  `(name, partitionKey)`. For `SELECT * FROM foo` where foo is
+  broadcast, the driver sends the task with `partitionKey="broadcast"`
+  (matches the `MeshRegistrar.registerBroadcastAsDistributed`
+  convention).
+
+One physical `NdjsonLocalTable` backs both slots — the second slot
+is a thin rewrapper that delegates `openScan()` to the first. No
+duplicate load, no duplicate memory.
+
+=== Journal persistence + compaction
+
+The agent-side journal at
+`~/.hitorro/agent/runtime-tables/<agentId>.jsonl` is append-only
+NDJSON:
+
+----
+{"op":"register","msg":{...}}
+{"op":"register","msg":{...}}
+{"op":"unregister","name":"foo","partitionKey":null}
+----
+
+On boot, `loadActive()` replays the file, deduping by
+`(name, partitionKey)` and dropping any key with a later tombstone.
+The surviving set is what gets reinstalled BEFORE the agent opens
+its NATS subscription — no window where queries could hit a
+half-loaded state.
+
+`compact()` runs once at end of boot replay: if the file has > 2
+lines of savings vs the active set, rewrite to a `.tmp` sibling
+then atomic-rename. Crash mid-compaction leaves either the old file
+or the new one, never a partial. Threshold is intentionally low
+(3+ lines to drop) so churny dev loops don't accumulate cruft.
+
+=== Driver-side tracker + per-partition keying
+
+`RuntimeTableTracker` records what the driver registered so the UI
+listing survives driver restarts. Keyed by
+`name` (broadcast) OR `name@partitionKey` (partitioned) — earlier
+name-only keying silently overwrote entries when a partitioned
+table registered N slots. Fixed with the same
+`(name, partitionKey)` convention the agent registry uses.
+
+Persistence is atomic-rewrite to
+`~/.hitorro/driver/runtime-tables.json` on every mutation. Not
+append-only because the state is small (kilobytes even in busy
+mesh) and load-on-boot is simpler with a full snapshot than a
+compacted log.
+
+=== Partition placement rationale
+
+`PartitionPlacement` is pluggable because different workloads want
+different rules:
+
+* **Consistent hash** (default) — deterministic for stable agent
+  sets. Same (`tableName`, `partitionKey`) lands on the same agent
+  across driver restarts. Sorts the live-agent list before
+  hashing so caller order doesn't matter.
+* **Round-robin** — simplest even spread; doesn't preserve
+  assignments across agent-set changes.
+* **Custom** — a caller-supplied `PartitionPlacement` Spring bean.
+  For rules that depend on external state: per-partition
+  affinity (agent-local disk), rack awareness, whatever.
+
+Explicit `agentId` per partition on the register request short-
+circuits placement entirely. Sticky routing when it matters
+(operator knows the data is co-located).
+
+=== Reconciler grace period
+
+Two failure modes to guard against:
+
+. **Real drop** — target agent crashed, permanent. Re-hash ASAP.
+. **Transient blip** — heartbeat gap from GC or network hiccup;
+  agent will be back in a couple of seconds. Re-hashing here just
+  causes churn.
+
+Grace period distinguishes them: only re-hash when the target has
+been *continuously* absent for > `grace-ms`. If the agent comes
+back mid-grace, the first-missing mark is cleared. Default 15s
+matches `agent-expiry`, so we're always a bit more cautious than
+the mesh's own liveness threshold.
+
+Manual reconcile ignores grace (`graceMs=0`) — operator explicitly
+asked, so honor immediately.
+
+=== SinkRegistry decorator hook
+
+Pipeline sinks that write NDJson can auto-register via a
+`registerAsTable` block on `SinkSpec.NdjsonFile`. Wiring pattern:
+
+* `SinkRegistry` exposes `registerDecorator(BiFunction<SinkSpec, Sink, Sink>)`
+  — a plug point where any Spring bean can wrap the built sink
+  before returning it.
+* Driver-app's `PipelineAutoRegisterDecorator` @PostConstruct-wires
+  itself as a decorator; on close of an NDJson sink with
+  `registerAsTable`, it calls `QueryWriteController.registerExisting`
+  internally (no HTTP round-trip). Registration failure logs but
+  doesn't fail the sink close — the file was written; only the SQL
+  binding lags.
+
+Not runtime-tables-specific — anything wanting a close-time hook
+(metrics, retry wrappers, tracing) uses the same mechanism.
+
+<<<
+
+[#module-hierarchy]
+== Module hierarchy
+
+Which repo depends on which, and where to look for what:
+
+----
+     hitorro-core, hitorro-basefile, hitorro-jsontypesystem, hitorro-streams
+                                    │
+     (mesh contract — one repo, no deps on the runtime shape)
+                                    │
+                          hitorro-mesh-core                ◄── protocol messages + subjects
+                                    │
+                    ┌───────────────┼───────────────┐
+                    │               │               │
+             hitorro-mesh-      hitorro-mesh-   hitorro-mesh-
+                driver             agent          examples
+                    │               │               │
+                    └───────┬───────┘               │
+                            │                       │
+             hitorro-mesh-driver-app   hitorro-mesh-agent-app
+                    │                          │
+                    │                          │
+      (Spring Boot runtimes — REST + wiring + everything)
+                            │
+                            ├─ hitorro-mesh-pipelines           ◄── DAG jobs
+                            │      ├── -kvstore                 ◄── RocksDB sink
+                            │      ├── -lucene                  ◄── Lucene sink
+                            │      └── -jvstype                 ◄── JVS-aware Lucene
+                            ├─ hitorro-mesh-datasets            ◄── shipped datasets
+                            ├─ hitorro-mesh-agent-pipelines     ◄── agent-side pipelines
+                            └─ hitorro-mesh-fleet-retrieval     ◄── cross-fleet search
+----
+
+What each does:
+
+[cols="1,3", options="header"]
+|===
+| Module | Purpose
+
+| `hitorro-mesh-core`
+| Protocol messages (`TaskDescriptor`, `ResultMessage`,
+  `RegisterTableMessage`, …), `Subjects` constants, transport SPI
+  (`MeshTransport` interface + `InMemoryMeshTransport` impl). No
+  Spring, no filesystem, no NATS.
+
+| `hitorro-mesh-driver`
+| Driver core — `MeshDriver`, `QueryDispatcher`, `QueryPlanner`,
+  `DistributedTableRegistry`, `LiveAgentRegistry`. Zero Spring.
+
+| `hitorro-mesh-agent`
+| Agent core — `MeshAgent`, `TaskExecutor`, `RuntimeTableRegistry`,
+  `HeartbeatPublisher`. Also zero Spring.
+
+| `hitorro-mesh-driver-app`
+| Spring Boot runtime for the driver — REST controllers, storage
+  browser, MinIO lifecycle, pipeline auto-register decorator,
+  metrics, everything else that touches HTTP.
+
+| `hitorro-mesh-agent-app`
+| Spring Boot runtime for an agent — `NdjsonLocalTable`,
+  `ParquetLocalTable`, `RuntimeTableInstaller`, `S3AdapterInstaller`,
+  `TableInventoryResponder`. Actuator, metrics.
+
+| `hitorro-mesh-nats`
+| NATS transport — bridges `MeshTransport` to real NATS. Optional;
+  swap with in-memory for tests.
+
+| `hitorro-mesh-pipelines`
+| DAG job framework — `JobSpec`, `JobRunner`, `NodeRunner`,
+  `SinkRegistry`. Runs inside the driver by default; adapter
+  modules layer real sinks.
+
+| `hitorro-mesh-datasets`
+| Shipped public datasets (currencies, languages, countries, …)
+  + `MeshRegistrar` for bulk boot registration.
+
+| `hitorro-mesh-examples`
+| Runnable demos + smoke scripts + Docker Compose examples for
+  every tier.
+|===
+
+<<<
+
 [#common-use-cases]
 == Common use cases
 
