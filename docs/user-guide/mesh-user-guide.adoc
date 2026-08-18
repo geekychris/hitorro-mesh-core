@@ -1965,6 +1965,58 @@ Credentials cross the wire. Use TLS + NATS auth
 (<<NatsSecurityProperties — auth + TLS>>) when the mesh isn't
 localhost-only.
 
+[plantuml, s3-hot-switch, svg]
+....
+@startuml
+skinparam backgroundColor transparent
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam ArrowColor #333
+skinparam sequence {
+  ActorBackgroundColor #F18F01
+  ActorBorderColor #C67300
+  ActorFontColor white
+  ParticipantBackgroundColor #E8F1F5
+  ParticipantBorderColor #2E86AB
+  ParticipantFontColor #333
+  LifeLineBackgroundColor #F5F5F5
+  LifeLineBorderColor #999
+}
+
+actor Operator
+participant "Cluster tab\n(browser)" as UI
+participant "MinIO\nLifecycleSvc" as MLS
+database Docker
+database MinIO
+participant "Driver\nBaseFile" as DBF
+database NATS
+participant "Agent US" as AU
+participant "Agent EU" as AE
+participant "Agent\nBaseFile" as ABF
+
+Operator -> UI : click ▶ Start MinIO
+UI -> MLS : POST /mesh/storage/minio/start
+MLS -> Docker : docker compose up -d\n(minio-up.sh)
+Docker -> MinIO : container start
+MLS -> MinIO : poll /minio/health/live\n(until 200)
+MLS -> DBF : addProtocolAdapter(MinIO)\n+ register Spring singleton
+MLS -> NATS : publish EnableS3Message\non mesh.agent.control.enable-s3
+
+par
+  NATS -> AU : EnableS3Message
+  AU -> ABF : addProtocolAdapter(MinIO)
+also
+  NATS -> AE : EnableS3Message
+  AE -> ABF : addProtocolAdapter(MinIO)
+end
+
+MLS -> UI : {reachable:true, agentsNotified:2}
+UI -> Operator : badge → "running"\nendpoint + creds shown
+@enduml
+....
+
 <<<
 
 [#query-export]
@@ -2259,6 +2311,58 @@ One physical `NdjsonLocalTable` backs both slots — the second slot
 is a thin rewrapper that delegates `openScan()` to the first. No
 duplicate load, no duplicate memory.
 
+[plantuml, register-table-fanout, svg]
+....
+@startuml
+skinparam backgroundColor transparent
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam ArrowColor #333
+skinparam sequence {
+  ActorBackgroundColor #F18F01
+  ActorBorderColor #C67300
+  ActorFontColor white
+  ParticipantBackgroundColor #E8F1F5
+  ParticipantBorderColor #2E86AB
+  ParticipantFontColor #333
+  LifeLineBackgroundColor #F5F5F5
+  LifeLineBorderColor #999
+}
+
+actor Client
+participant "REST\ncontroller" as REST
+participant "Driver\ntables" as DT
+participant "Runtime\nTracker" as RT
+database NATS
+participant "Agent US" as AU
+participant "Agent EU" as AE
+database "US\njournal" as JU
+database "EU\njournal" as JE
+
+Client -> REST : POST /mesh/queries/write\n{sql, register:true}
+REST -> REST : run SQL, sink to file,\ninduce type from first N rows
+REST -> DT : registerBroadcast(name)\nregister(SimpleRuntimeTable)
+REST -> RT : record(msg, agentsNotified)
+REST -> NATS : publish RegisterTableMessage\non mesh.agent.control.register-table
+
+par
+  NATS -> AU : RegisterTableMessage
+  AU -> AU : NdjsonLocalTable.load(uri)
+  AU -> AU : install pk=null (JOIN slot)\ninstall pk="broadcast" (SELECT slot)
+  AU -> JU : append {op:register, msg}
+also
+  NATS -> AE : RegisterTableMessage
+  AE -> AE : NdjsonLocalTable.load(uri)
+  AE -> AE : install pk=null (JOIN slot)\ninstall pk="broadcast" (SELECT slot)
+  AE -> JE : append {op:register, msg}
+end
+
+REST -> Client : {success, registered:{tableName, agentsNotified:2}}
+@enduml
+....
+
 === Journal persistence + compaction
 
 The agent-side journal at
@@ -2335,6 +2439,60 @@ the mesh's own liveness threshold.
 Manual reconcile ignores grace (`graceMs=0`) — operator explicitly
 asked, so honor immediately.
 
+[plantuml, reconciler-grace, svg]
+....
+@startuml
+skinparam backgroundColor transparent
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam ArrowColor #333
+skinparam sequence {
+  ActorBackgroundColor #F18F01
+  ActorBorderColor #C67300
+  ActorFontColor white
+  ParticipantBackgroundColor #E8F1F5
+  ParticipantBorderColor #2E86AB
+  ParticipantFontColor #333
+  LifeLineBackgroundColor #F5F5F5
+  LifeLineBorderColor #999
+}
+
+participant "Reconciler\nPoller" as P
+participant "PartitionReconciler" as R
+participant "LiveAgent\nRegistry" as L
+participant "Runtime\nTracker" as T
+participant "Partition\nPlacement" as PP
+database NATS
+
+== Tick 1 (t=0s) ==
+P -> R : reconcile(graceMs=15000)
+R -> L : agentsWith([jvssql])
+L --> R : {agent-eu}\n(agent-us missing!)
+R -> T : snapshot()
+T --> R : [{world_pop, na, → agent-us}]
+R -> R : agent-us MISSING\n→ mark firstMissingAt=t0
+
+== Tick 2 (t=5s) — still missing, within grace ==
+P -> R : reconcile(15000)
+R -> R : now - firstMissingAt = 5s\n5s < 15s → withinGrace
+
+== Tick 3 (t=10s) — still missing ==
+P -> R : reconcile(15000)
+R -> R : 10s < 15s → withinGrace
+
+== Tick 4 (t=17s) — grace expired, re-hash ==
+P -> R : reconcile(15000)
+R -> R : 17s > 15s → re-hash
+R -> PP : assign("world_pop", [na], [agent-eu])
+PP --> R : {na → agent-eu}
+R -> NATS : publish RegisterTableMessage\n(targetAgentId=agent-eu)
+R -> T : forget(world_pop, na)\nrecord(msg, targetAgentId=agent-eu)
+NATS -> R : (indirect) agent-eu installs\n+ advertises partition:world_pop:na
+@enduml
+....
+
 === SinkRegistry decorator hook
 
 Pipeline sinks that write NDJson can auto-register via a
@@ -2352,6 +2510,83 @@ Pipeline sinks that write NDJson can auto-register via a
 
 Not runtime-tables-specific — anything wanting a close-time hook
 (metrics, retry wrappers, tracing) uses the same mechanism.
+
+=== Inventory probe — request/reply on plain publish/subscribe
+
+`MeshTransport` intentionally exposes only publish + subscribe (see
+the design note on the SPI). NATS's native request/reply isn't in
+the contract. The inventory probe builds request/reply on top of
+that narrower primitive so the mechanism stays swappable:
+
+. Driver generates a UUID `replyId`.
+. Driver subscribes to
+  `mesh.agent.control.inventory-reply.<replyId>.>` — wildcard for
+  the agent-id suffix.
+. Driver publishes `TableInventoryRequest{replyId}` on
+  `mesh.agent.control.inventory-request`.
+. Every agent's `TableInventoryResponder` picks it up, builds a
+  reply from `AgentConfig.localTables + broadcastTables +
+  RuntimeTableRegistry.snapshot`, publishes on
+  `mesh.agent.control.inventory-reply.<replyId>.<agentId>`.
+. Driver aggregates for a deadline (default 1.5s) then unsubscribes.
+. `agentsAsked = |live jvssql set|`, `agentsReplied = |replies
+  received|`. Slow/dropped agents just don't show up — the UI
+  displays "N/M agents responded".
+
+Not exactly-once — an agent that boots mid-probe won't be in the
+`asked` count but its reply might land. The reconciler tolerates
+this: it re-runs on every tick.
+
+[plantuml, inventory-probe, svg]
+....
+@startuml
+skinparam backgroundColor transparent
+skinparam defaultFontName Helvetica
+skinparam defaultFontSize 12
+skinparam sequenceMessageAlign center
+skinparam shadowing false
+skinparam ArrowColor #333
+skinparam sequence {
+  ActorBackgroundColor #F18F01
+  ActorBorderColor #C67300
+  ActorFontColor white
+  ParticipantBackgroundColor #E8F1F5
+  ParticipantBorderColor #2E86AB
+  ParticipantFontColor #333
+  LifeLineBackgroundColor #F5F5F5
+  LifeLineBorderColor #999
+}
+
+actor Client
+participant "REST\ncontroller" as REST
+participant "InventoryProbe" as IP
+database NATS
+participant "Agent US" as AU
+participant "Agent EU" as AE
+
+Client -> REST : GET /mesh/queries/inventory
+REST -> IP : probe(1500ms)
+IP -> IP : generate replyId (UUID)
+IP -> NATS : subscribe mesh.agent.control.\ninventory-reply.<replyId>.*
+IP -> NATS : publish TableInventoryRequest{replyId}\non mesh.agent.control.inventory-request
+
+par
+  NATS -> AU : TableInventoryRequest
+  AU -> AU : build reply from AgentConfig\n+ RuntimeTableRegistry
+  AU -> NATS : publish TableInventoryReply\non inventory-reply.<replyId>.agent-us
+also
+  NATS -> AE : TableInventoryRequest
+  AE -> AE : build reply from AgentConfig\n+ RuntimeTableRegistry
+  AE -> NATS : publish TableInventoryReply\non inventory-reply.<replyId>.agent-eu
+end
+
+NATS -> IP : both replies (via wildcard sub)
+IP -> IP : wait until deadline\nOR agentsAsked replies received
+IP -> IP : unsubscribe
+IP -> REST : {agentsAsked:2, agentsReplied:2, replies:[…]}
+REST -> Client : 200 OK JSON
+@enduml
+....
 
 <<<
 
