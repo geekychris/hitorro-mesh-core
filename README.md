@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Hitorro Mesh Core logo" width="180">
+</p>
+
 # Hitorro Mesh
 
 > **New here? Jump straight to [GETTING_STARTED.md](GETTING_STARTED.md)** —
