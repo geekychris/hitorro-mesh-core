@@ -3,7 +3,7 @@
  */
 package com.hitorro.mesh;
 
-import com.fasterxml.jackson.databind.JsonNode;
+import tools.jackson.databind.JsonNode;
 
 /**
  * Envelope for one message on the {@code mesh.query.result.<queryId>.<pkey>} subject.
