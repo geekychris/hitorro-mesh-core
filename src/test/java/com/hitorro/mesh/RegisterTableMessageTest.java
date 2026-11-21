@@ -3,7 +3,8 @@
  */
 package com.hitorro.mesh;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hitorro.util.json.JsonMappers;
+import tools.jackson.databind.ObjectMapper;
 import org.junit.jupiter.api.Test;
 
 import java.util.Map;
@@ -89,7 +90,7 @@ class RegisterTableMessageTest {
 
     @Test
     void jacksonRoundTrip_fileBacked_preservesFields() throws Exception {
-        ObjectMapper mapper = new ObjectMapper();
+        ObjectMapper mapper = JsonMappers.json();
         RegisterTableMessage orig = new RegisterTableMessage(
                 "t", TYPE_JSON, "file:/x", "parquet", true, null);
         String json = mapper.writeValueAsString(orig);
@@ -99,7 +100,7 @@ class RegisterTableMessageTest {
 
     @Test
     void jacksonRoundTrip_streaming_preservesSourceConfig() throws Exception {
-        ObjectMapper mapper = new ObjectMapper();
+        ObjectMapper mapper = JsonMappers.json();
         RegisterTableMessage orig = new RegisterTableMessage(
                 "t", TYPE_JSON, "", "kafka", true, null,
                 Map.of("bootstrap-servers", "b:9092", "group-id", "g", "topic", "z"));
@@ -112,7 +113,7 @@ class RegisterTableMessageTest {
     @Test
     void jacksonRoundTrip_oldSixFieldPayload_deserialises_sourceConfigNull() throws Exception {
         // Simulate a message from a pre-streaming driver — no sourceConfig field.
-        ObjectMapper mapper = new ObjectMapper();
+        ObjectMapper mapper = JsonMappers.json();
         String json = "{\"name\":\"t\",\"typeJson\":" + mapper.writeValueAsString(TYPE_JSON)
                 + ",\"uri\":\"file:/x\",\"format\":\"ndjson\","
                 + "\"broadcast\":true,\"partitionKey\":null}";

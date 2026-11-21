@@ -3,15 +3,17 @@
  */
 package com.hitorro.mesh;
 
-import com.fasterxml.jackson.databind.ObjectMapper;
+import com.hitorro.util.json.JsonMappers;
+import tools.jackson.databind.ObjectMapper;
 
 /**
  * Jackson codec used by both driver and agent for every protocol type.
- * One mapper, one place, no drift.
+ * One mapper, one place, no drift. It is hitorro-core's shared mapper with
+ * Jackson 2 defaults, so 4.x nodes exchange the same bytes as 3.x nodes.
  */
 public final class Codecs {
 
-    public static final ObjectMapper MAPPER = new ObjectMapper();
+    public static final ObjectMapper MAPPER = JsonMappers.json();
 
     private Codecs() {}
 
